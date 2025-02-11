@@ -1025,3 +1025,45 @@ plt.tight_layout()
 plt.show()
 
 
+# 4. Demodulate the pupil field to reveal the residual phase
+# ---------------------------------------------------
+# Multiply by the conjugate Fourier kernel corresponding to (u0, v0)
+E_pupil_demod = E_pupil * np.exp(1j * 2 * np.pi * (u0 * X + v0 * Y))
+phase_residual = np.angle(E_pupil_demod)
+
+# Consider only points inside the pupil.
+pupil_mask = (pupil > 0)
+
+# Compute the average phase in the pupil (using complex averaging to avoid 2π issues)
+phase_mean = np.angle(np.mean(np.exp(1j * phase_residual[pupil_mask])))
+
+# Compute the phase difference relative to the average
+phase_diff = np.angle(np.exp(1j * (phase_residual - phase_mean)))
+
+# Define a threshold (in radians) for the in-phase condition
+threshold = 0.2  # This value controls the "width" of the in-phase region.
+
+# Instead of a binary (hard) mask, we build a soft mask using a Gaussian function.
+# We choose sigma such that at |phase_diff| = threshold, the mask value is 0.5.
+import numpy as np
+sigma = threshold / np.sqrt(2 * np.log(2))  # because exp(-threshold^2/(2*sigma^2)) = 0.5
+
+# soft_mask_phase is 1 when phase_diff=0 and decays continuously as |phase_diff| increases.
+soft_mask_phase = np.exp(- (np.abs(phase_diff)**2) / (2 * sigma**2))
+
+# Apply the pupil mask to ensure the soft mask is defined only inside the pupil.
+soft_mask_phase = soft_mask_phase * pupil_mask.astype(float)
+
+# Option 1: If you want to suppress the contributions gradually, you can reduce the pupil field
+# by multiplying by (1 - soft_mask_phase).
+E_pupil_modified = E_pupil * (1 - soft_mask_phase)
+
+# Option 2: Alternatively, if you want to simply weight the contributions later (e.g., for analysis),
+# you can use soft_mask_phase directly as a weighting factor.
+
+# For example, computing a modified image:
+E_image_modified = np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(E_pupil_modified)))
+I_image_modified = np.abs(E_image_modified)**2
+
+# (Now you can compare I_image_modified to the original I_image.)
+
