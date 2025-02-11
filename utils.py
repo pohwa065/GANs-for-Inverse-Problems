@@ -780,3 +780,248 @@ if __name__ == '__main__':
     print("ViT Feature Extractor output shape:", vit_features.shape)
 
 
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ---------------------------------------------------
+# 1. Set up the simulation: grid, pupil, and random phase
+# ---------------------------------------------------
+N = 512             # grid size (number of samples per dimension)
+L = 5e-3            # physical size of the pupil plane (meters)
+dx = L / N          # spatial sampling interval
+
+# Create spatial coordinate arrays (centered at zero)
+x = np.linspace(-L/2, L/2, N)
+y = x.copy()
+X, Y = np.meshgrid(x, y)
+
+# Define a circular pupil (aperture) of radius R
+R = 1e-3            # pupil radius (meters)
+pupil = np.zeros((N, N))
+pupil[np.sqrt(X**2 + Y**2) <= R] = 1.0
+
+# Impose a random phase over the pupil
+np.random.seed(0)   # for reproducibility
+random_phase = np.random.uniform(0, 2*np.pi, (N, N))
+E_pupil = pupil * np.exp(1j * random_phase)
+
+# ---------------------------------------------------
+# 2. Compute the image (speckle) field via Fourier Transform
+# ---------------------------------------------------
+# The imaging plane field is the Fourier transform of the pupil field.
+E_image = np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(E_pupil)))
+I_image = np.abs(E_image)**2  # intensity in the image (speckle) plane
+
+# Define spatial frequency coordinates for the image plane (u,v)
+u = np.fft.fftshift(np.fft.fftfreq(N, d=dx))
+v = u.copy()  # square grid
+
+# ---------------------------------------------------
+# 3. Identify the bright spot in the image plane
+# ---------------------------------------------------
+max_idx = np.unravel_index(np.argmax(I_image), I_image.shape)
+u0 = u[max_idx[1]]
+v0 = v[max_idx[0]]
+print(f"Bright spot located at: u0 = {u0:.2e}, v0 = {v0:.2e}")
+
+# ---------------------------------------------------
+# 4. Demodulate the pupil field to reveal the residual phase
+# ---------------------------------------------------
+# Multiply by the conjugate Fourier kernel corresponding to (u0, v0)
+E_pupil_demod = E_pupil * np.exp(1j * 2 * np.pi * (u0 * X + v0 * Y))
+phase_residual = np.angle(E_pupil_demod)
+
+# Consider only points inside the pupil.
+pupil_mask = (pupil > 0)
+
+# Compute the average phase in the pupil (using complex averaging to avoid 2π issues)
+phase_mean = np.angle(np.mean(np.exp(1j * phase_residual[pupil_mask])))
+
+# Compute the phase difference relative to the average
+phase_diff = np.angle(np.exp(1j * (phase_residual - phase_mean)))
+
+# Define a threshold (in radians) to decide which regions are “in-phase”
+threshold = 0.2  # adjust as needed; smaller threshold means stricter condition
+contrib_mask = (np.abs(phase_diff) < threshold) & pupil_mask
+
+# ---------------------------------------------------
+# 5. Approach 1: Add a Phase Plate to Disturb the Coherent Contribution
+# ---------------------------------------------------
+# Instead of blocking the contributions, add an extra phase (e.g. π/2)
+# over the pupil regions that are nearly in phase.
+phase_plate = np.zeros((N, N))
+phase_plate[contrib_mask] = np.pi / 2  # you can choose other values or even a spatially varying pattern
+
+# Create a modified pupil field with the phase plate added
+E_pupil_modified = E_pupil * np.exp(1j * phase_plate)
+
+# Compute the new image field and intensity
+E_image_modified = np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(E_pupil_modified)))
+I_image_modified = np.abs(E_image_modified)**2
+
+# ---------------------------------------------------
+# 6. Approach 2: Alternative Idea – Apodization
+# ---------------------------------------------------
+# An alternative to altering the phase is to apply an amplitude taper (apodization)
+# to smooth out the abrupt phase/amplitude changes. Here, we use a Gaussian taper.
+apodization = np.exp(-((X/(0.7*R))**2 + (Y/(0.7*R))**2))
+E_pupil_apod = pupil * np.exp(1j * random_phase) * apodization
+E_image_apod = np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(E_pupil_apod)))
+I_image_apod = np.abs(E_image_apod)**2
+
+# ---------------------------------------------------
+# 7. Plot the Results
+# ---------------------------------------------------
+plt.figure(figsize=(16, 12))
+
+# (a) Original Image Intensity (Speckle Pattern)
+plt.subplot(2, 3, 1)
+plt.imshow(I_image, extent=[u[0], u[-1], v[0], v[-1]], cmap='inferno')
+plt.title("Original Image Intensity")
+plt.xlabel("u (spatial freq.)")
+plt.ylabel("v (spatial freq.)")
+plt.colorbar()
+
+# (b) Residual Phase in the Pupil (after Demodulation)
+plt.subplot(2, 3, 2)
+plt.imshow(phase_residual, extent=[x[0], x[-1], y[0], y[-1]], cmap='hsv')
+plt.title("Residual Phase (Demodulated)")
+plt.xlabel("x (m)")
+plt.ylabel("y (m)")
+plt.colorbar()
+
+# (c) Contributing Region in the Pupil (mask)
+plt.subplot(2, 3, 3)
+plt.imshow(contrib_mask, extent=[x[0], x[-1], y[0], y[-1]], cmap='gray')
+plt.title("Pupil Regions Contributing Coherently")
+plt.xlabel("x (m)")
+plt.ylabel("y (m)")
+plt.colorbar()
+
+# (d) Image with the Phase Plate Added (Bright spot suppressed)
+plt.subplot(2, 3, 4)
+plt.imshow(I_image_modified, extent=[u[0], u[-1], v[0], v[-1]], cmap='inferno')
+plt.title("Image with Phase Plate")
+plt.xlabel("u (spatial freq.)")
+plt.ylabel("v (spatial freq.)")
+plt.colorbar()
+
+# (e) The Phase Plate Pattern Applied to the Pupil
+plt.subplot(2, 3, 5)
+plt.imshow(phase_plate, extent=[x[0], x[-1], y[0], y[-1]], cmap='jet')
+plt.title("Phase Plate Pattern")
+plt.xlabel("x (m)")
+plt.ylabel("y (m)")
+plt.colorbar()
+
+# (f) Alternative: Image with Apodization (Another way to suppress intensity peaks)
+plt.subplot(2, 3, 6)
+plt.imshow(I_image_apod, extent=[u[0], u[-1], v[0], v[-1]], cmap='inferno')
+plt.title("Image with Apodization")
+plt.xlabel("u (spatial freq.)")
+plt.ylabel("v (spatial freq.)")
+plt.colorbar()
+
+plt.tight_layout()
+plt.show()
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ---------------------------------------------------
+# 1. Set up the simulation: grid, pupil, and random phase
+# ---------------------------------------------------
+N = 512             # grid size (number of samples per dimension)
+L = 5e-3            # physical size of the pupil plane (meters)
+dx = L / N          # spatial sampling interval
+
+# Create spatial coordinate arrays (centered at zero)
+x = np.linspace(-L/2, L/2, N)
+y = x.copy()
+X, Y = np.meshgrid(x, y)
+
+# Define a circular pupil (aperture) of radius R
+R = 1e-3            # pupil radius (meters)
+pupil = np.zeros((N, N))
+pupil[np.sqrt(X**2 + Y**2) <= R] = 1.0
+
+# Impose a random phase over the pupil
+np.random.seed(0)   # for reproducibility
+random_phase = np.random.uniform(0, 2*np.pi, (N, N))
+E_pupil = pupil * np.exp(1j * random_phase)
+
+# ---------------------------------------------------
+# 2. Create a Soft Mask (Apodization Function)
+# ---------------------------------------------------
+# Instead of a hard binary mask, we use a Gaussian taper that smoothly decreases from the center.
+# The Gaussian width is chosen relative to the pupil radius.
+sigma = R / 2.0  # adjust sigma for a suitable smoothness
+soft_mask = np.exp(-((X**2 + Y**2) / (2 * sigma**2)))
+
+# Multiply the pupil by the soft mask (note that the soft mask here modulates amplitude)
+E_pupil_soft = pupil * soft_mask * np.exp(1j * random_phase)
+
+# ---------------------------------------------------
+# 3. Compute the Image Field (Speckle Pattern)
+# ---------------------------------------------------
+def compute_image(E):
+    # Compute the Fourier transform (image plane field) and intensity
+    E_image = np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(E)))
+    I_image = np.abs(E_image)**2
+    return E_image, I_image
+
+# Original (hard-edged) pupil image
+E_image_orig, I_image_orig = compute_image(E_pupil)
+
+# Soft mask (apodized) pupil image
+E_image_soft, I_image_soft = compute_image(E_pupil_soft)
+
+# ---------------------------------------------------
+# 4. Plot the Results
+# ---------------------------------------------------
+plt.figure(figsize=(14, 10))
+
+# (a) Pupil Intensity (hard-edged)
+plt.subplot(2, 3, 1)
+plt.imshow(np.abs(E_pupil)**2, extent=[x[0], x[-1], y[0], y[-1]], cmap='gray')
+plt.title("Original Pupil Intensity (Hard Mask)")
+plt.xlabel("x (m)")
+plt.ylabel("y (m)")
+plt.colorbar()
+
+# (b) Soft Mask (Apodization Function)
+plt.subplot(2, 3, 2)
+plt.imshow(soft_mask, extent=[x[0], x[-1], y[0], y[-1]], cmap='viridis')
+plt.title("Soft Mask (Gaussian Apodization)")
+plt.xlabel("x (m)")
+plt.ylabel("y (m)")
+plt.colorbar()
+
+# (c) Pupil Intensity with Soft Mask Applied
+plt.subplot(2, 3, 3)
+plt.imshow(np.abs(E_pupil_soft)**2, extent=[x[0], x[-1], y[0], y[-1]], cmap='gray')
+plt.title("Pupil Intensity with Soft Mask")
+plt.xlabel("x (m)")
+plt.ylabel("y (m)")
+plt.colorbar()
+
+# (d) Image Intensity from Original (Hard Mask) Pupil
+plt.subplot(2, 3, 4)
+plt.imshow(I_image_orig, extent=[-1e3, 1e3, -1e3, 1e3], cmap='inferno')
+plt.title("Image from Hard-edged Pupil")
+plt.xlabel("u (spatial freq.)")
+plt.ylabel("v (spatial freq.)")
+plt.colorbar()
+
+# (e) Image Intensity from Soft Masked Pupil
+plt.subplot(2, 3, 5)
+plt.imshow(I_image_soft, extent=[-1e3, 1e3, -1e3, 1e3], cmap='inferno')
+plt.title("Image from Soft (Apodized) Pupil")
+plt.xlabel("u (spatial freq.)")
+plt.ylabel("v (spatial freq.)")
+plt.colorbar()
+
+plt.tight_layout()
+plt.show()
+
+
