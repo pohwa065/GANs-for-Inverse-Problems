@@ -1196,3 +1196,205 @@ plt.colorbar()
 
 plt.tight_layout()
 plt.show()
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+
+# =============================================================================
+# 1. Setup: Define grid, pupil, and simulation parameters.
+# =============================================================================
+N = 512               # grid size (samples per dimension)
+L = 5e-3              # physical size of the pupil plane in meters
+dx = L / N            # spatial sampling interval
+
+# Spatial coordinates (centered at zero)
+x = np.linspace(-L/2, L/2, N)
+y = x.copy()
+X, Y = np.meshgrid(x, y)
+
+# Define a circular pupil (aperture) of radius R
+R = 1e-3              # pupil radius (meters)
+pupil = np.zeros((N, N))
+pupil[np.sqrt(X**2 + Y**2) <= R] = 1.0
+
+num_realizations = 50  # number of independent speckle realizations
+
+# =============================================================================
+# 2. Generate ensemble of speckle images and store pupil fields.
+# =============================================================================
+I_orig_accum = np.zeros((N, N))
+E_pupil_list = []  # store each realization's pupil field
+
+for i in range(num_realizations):
+    # Generate a pupil field with a random phase.
+    random_phase = np.random.uniform(0, 2*np.pi, (N, N))
+    E_pupil_i = pupil * np.exp(1j * random_phase)
+    E_pupil_list.append(E_pupil_i)
+    
+    # Propagate to the image plane via FFT.
+    E_img_i = np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(E_pupil_i)))
+    I_img_i = np.abs(E_img_i)**2
+    I_orig_accum += I_img_i
+
+# Ensemble-averaged original speckle image.
+I_orig_avg = I_orig_accum / num_realizations
+
+# Define spatial frequency axes for the image plane.
+u = np.fft.fftshift(np.fft.fftfreq(N, d=dx))
+v = u.copy()
+
+# =============================================================================
+# 3. Find the ensemble-averaged bright spot (maximum intensity) and its (u₀,v₀).
+# =============================================================================
+max_idx = np.unravel_index(np.argmax(I_orig_avg), I_orig_avg.shape)
+u0 = u[max_idx[1]]   # Column index corresponds to u
+v0 = v[max_idx[0]]   # Row index corresponds to v
+print("Ensemble-averaged bright spot at (u0, v0) =", u0, v0)
+
+# =============================================================================
+# 4. For each realization, demodulate the pupil field and compute a mask
+#    based on the residual phase at the bright spot.
+# =============================================================================
+# We use the same threshold (in radians) for all realizations.
+threshold = 0.2  # radians
+# Choose sigma so that at |phase_diff| == threshold, Gaussian value ~0.5.
+sigma = threshold / np.sqrt(np.log(2))
+phase_shift_const = np.pi / 2  # for waveplate modification
+
+# Initialize accumulators for the modified images.
+I_hard_accum = np.zeros((N, N))
+I_soft_accum = np.zeros((N, N))
+I_wave_accum = np.zeros((N, N))
+
+# Also accumulate contrast values from each realization.
+contrasts_hard = []
+contrasts_soft = []
+contrasts_wave = []
+
+for E_pupil_i in E_pupil_list:
+    
+    # Demodulate the pupil field: multiply by the conjugate Fourier kernel corresponding to (u0,v0).
+    E_demod = E_pupil_i * np.exp(1j * 2 * np.pi * (u0 * X + v0 * Y))
+    phase_res = np.angle(E_demod)
+    
+    # Consider only points inside the pupil.
+    mask_pupil = (pupil > 0)
+    
+    # Compute average residual phase over the pupil (using only pupil points).
+    phi_avg = np.angle(np.mean(np.exp(1j * phase_res[mask_pupil])))
+    
+    # Compute the residual phase difference relative to the average.
+    phase_diff = np.angle(np.exp(1j * (phase_res - phi_avg)))
+    
+    # Generate a binary (hard) mask: coherent if |phase_diff| < threshold.
+    mask_binary = (np.abs(phase_diff) < threshold) & mask_pupil
+    
+    # Generate a soft mask using a Gaussian function of |phase_diff|.
+    soft_mask = np.exp(- (np.abs(phase_diff)**2) / (2 * sigma**2))
+    soft_mask = soft_mask * mask_pupil.astype(float)
+    
+    # =============================================================================
+    # 5. Pupil modifications over the coherent (masked) region.
+    # =============================================================================
+    # (a) Hard mask modification: zero out the pupil field where mask_binary is True.
+    E_pupil_hard = E_pupil_i * (1 - mask_binary.astype(float))
+    
+    # (b) Soft mask modification: attenuate the pupil field amplitude gradually.
+    E_pupil_soft = E_pupil_i * (1 - soft_mask)
+    
+    # (c) Waveplate modification: add a constant phase shift in the binary mask region.
+    E_pupil_wave = E_pupil_i.copy()
+    E_pupil_wave[mask_binary] *= np.exp(1j * phase_shift_const)
+    
+    # Propagate each modified pupil field to get the corresponding speckle image.
+    I_img_hard = np.abs(np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(E_pupil_hard))))**2
+    I_img_soft = np.abs(np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(E_pupil_soft))))**2
+    I_img_wave = np.abs(np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(E_pupil_wave))))**2
+    
+    I_hard_accum += I_img_hard
+    I_soft_accum += I_img_soft
+    I_wave_accum += I_img_wave
+    
+    # Compute speckle contrast (std/mean) for this realization.
+    c_hard = np.std(I_img_hard) / np.mean(I_img_hard)
+    c_soft = np.std(I_img_soft) / np.mean(I_img_soft)
+    c_wave = np.std(I_img_wave) / np.mean(I_img_wave)
+    contrasts_hard.append(c_hard)
+    contrasts_soft.append(c_soft)
+    contrasts_wave.append(c_wave)
+
+# Ensemble-averaged modified images.
+I_hard_avg = I_hard_accum / num_realizations
+I_soft_avg = I_soft_accum / num_realizations
+I_wave_avg = I_wave_accum / num_realizations
+
+# Compute ensemble speckle contrast from the averaged images.
+def speckle_contrast(I):
+    return np.std(I) / np.mean(I)
+
+contrast_orig = speckle_contrast(I_orig_avg)
+contrast_hard = speckle_contrast(I_hard_avg)
+contrast_soft = speckle_contrast(I_soft_avg)
+contrast_wave = speckle_contrast(I_wave_avg)
+
+print("\nEnsemble-averaged speckle contrast:")
+print("  Original:      {:.2f}".format(contrast_orig))
+print("  Hard mask:     {:.2f}".format(contrast_hard))
+print("  Soft mask:     {:.2f}".format(contrast_soft))
+print("  Waveplate:     {:.2f}".format(contrast_wave))
+
+# =============================================================================
+# 6. Plot the results.
+# =============================================================================
+fig, axs = plt.subplots(2, 3, figsize=(18, 12))
+
+# (a) Ensemble-averaged original speckle image with bright spot circled.
+axs[0, 0].imshow(I_orig_avg, extent=[u[0], u[-1], v[0], v[-1]], cmap='inferno', origin='lower')
+axs[0, 0].set_title("Ensemble Averaged Original\nContrast: {:.2f}".format(contrast_orig))
+axs[0, 0].set_xlabel("u (spatial freq.)")
+axs[0, 0].set_ylabel("v (spatial freq.)")
+# Circle the bright spot.
+radius_circle = (u[-1]-u[0]) * 0.05
+circle = patches.Circle((u0, v0), radius=radius_circle, edgecolor='cyan', facecolor='none', linewidth=2)
+axs[0, 0].add_patch(circle)
+plt.colorbar(ax=axs[0, 0])
+
+# (b) Show one instance of the binary mask on the pupil (from the last realization).
+axs[0, 1].imshow(mask_binary, extent=[x[0], x[-1], y[0], y[-1]], cmap='gray', origin='lower')
+axs[0, 1].set_title("Binary Mask (Coherent Region)")
+axs[0, 1].set_xlabel("x (m)")
+axs[0, 1].set_ylabel("y (m)")
+plt.colorbar(ax=axs[0, 1])
+
+# (c) Show one instance of the soft mask on the pupil (from the last realization).
+axs[0, 2].imshow(soft_mask, extent=[x[0], x[-1], y[0], y[-1]], cmap='viridis', origin='lower')
+axs[0, 2].set_title("Soft Mask on Pupil")
+axs[0, 2].set_xlabel("x (m)")
+axs[0, 2].set_ylabel("y (m)")
+plt.colorbar(ax=axs[0, 2])
+
+# (d) Ensemble-averaged speckle image with Hard Mask modification.
+axs[1, 0].imshow(I_hard_avg, extent=[u[0], u[-1], v[0], v[-1]], cmap='inferno', origin='lower')
+axs[1, 0].set_title("Hard Mask Modified\nContrast: {:.2f}".format(contrast_hard))
+axs[1, 0].set_xlabel("u (spatial freq.)")
+axs[1, 0].set_ylabel("v (spatial freq.)")
+plt.colorbar(ax=axs[1, 0])
+
+# (e) Ensemble-averaged speckle image with Soft Mask modification.
+axs[1, 1].imshow(I_soft_avg, extent=[u[0], u[-1], v[0], v[-1]], cmap='inferno', origin='lower')
+axs[1, 1].set_title("Soft Mask Modified\nContrast: {:.2f}".format(contrast_soft))
+axs[1, 1].set_xlabel("u (spatial freq.)")
+axs[1, 1].set_ylabel("v (spatial freq.)")
+plt.colorbar(ax=axs[1, 1])
+
+# (f) Ensemble-averaged speckle image with Waveplate modification.
+axs[1, 2].imshow(I_wave_avg, extent=[u[0], u[-1], v[0], v[-1]], cmap='inferno', origin='lower')
+axs[1, 2].set_title("Waveplate Modified\nContrast: {:.2f}".format(contrast_wave))
+axs[1, 2].set_xlabel("u (spatial freq.)")
+axs[1, 2].set_ylabel("v (spatial freq.)")
+plt.colorbar(ax=axs[1, 2])
+
+plt.tight_layout()
+plt.show()
