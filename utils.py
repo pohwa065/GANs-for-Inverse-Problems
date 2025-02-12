@@ -1067,3 +1067,132 @@ I_image_modified = np.abs(E_image_modified)**2
 
 # (Now you can compare I_image_modified to the original I_image.)
 
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Simulation parameters
+N = 512                  # grid size (samples per dimension)
+L = 5e-3                 # physical size of the pupil plane (meters)
+dx = L / N
+num_realizations = 50    # number of independent speckle realizations
+
+# Spatial coordinates (centered at zero)
+x = np.linspace(-L/2, L/2, N)
+y = x.copy()
+X, Y = np.meshgrid(x, y)
+
+# Define a circular pupil of radius R
+R = 1e-3
+pupil = np.zeros((N, N))
+pupil[np.sqrt(X**2 + Y**2) <= R] = 1.0
+
+def generate_speckle(E_pupil):
+    """Compute the intensity speckle pattern from a pupil field via FFT."""
+    E_image = np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(E_pupil)))
+    I_image = np.abs(E_image)**2
+    return I_image
+
+def ensemble_speckle(E_pupil_func, num_realizations):
+    """
+    Compute the ensemble-averaged intensity and speckle contrast
+    for a given pupil modification function E_pupil_func.
+    """
+    I_accum = np.zeros((N, N))
+    all_contrasts = []
+    for _ in range(num_realizations):
+        # Generate a new random phase for each realization
+        random_phase = np.random.uniform(0, 2*np.pi, (N, N))
+        E_pupil = pupil * np.exp(1j * random_phase)
+        # Apply the pupil modification (e.g. waveplate or soft mask)
+        E_mod = E_pupil_func(E_pupil, X, Y)
+        I_image = generate_speckle(E_mod)
+        I_accum += I_image
+        # Contrast for this realization:
+        contrast = np.std(I_image) / np.mean(I_image)
+        all_contrasts.append(contrast)
+    I_avg = I_accum / num_realizations
+    # Contrast computed from the ensemble-averaged intensity:
+    contrast_ensemble = np.std(I_avg) / np.mean(I_avg)
+    return I_avg, np.mean(all_contrasts), contrast_ensemble
+
+# ---------------------------
+# Define the pupil modification functions
+# ---------------------------
+
+def identity(E_pupil, X, Y):
+    """No modification; return the pupil field as is."""
+    return E_pupil
+
+def waveplate_mod(E_pupil, X, Y):
+    """
+    Waveplate modification:
+      Add a constant phase shift (π/2) to the region where X > 0.
+    This shifts the phase of that region relative to the rest.
+    """
+    phase_shift = np.pi / 2
+    mask_waveplate = np.where(X > 0, 1, 0)
+    return E_pupil * np.exp(1j * phase_shift * mask_waveplate)
+
+def soft_mask_mod(E_pupil, X, Y):
+    """
+    Soft mask modification:
+      Gradually suppress the pupil transmission for X > 0 using a smooth transition.
+    We use a tanh function to create a smooth transition from full transmission to suppression.
+    """
+    # Define a transition width (adjustable)
+    T = L / 20
+    # The tanh function yields values from -1 to 1; converting to [0,1]:
+    mask = (1 + np.tanh(X / (T/5))) / 2
+    # Here, the mask is ~0 for X << 0 and ~1 for X >> 0.
+    # To suppress the contributions in the X > 0 region smoothly, multiply by (1 - mask).
+    return E_pupil * (1 - mask)
+
+# ---------------------------
+# Compute ensemble averages for each modification
+# ---------------------------
+
+I_avg_id, contrast_id_avg, contrast_id_ensemble = ensemble_speckle(identity, num_realizations)
+I_avg_wp, contrast_wp_avg, contrast_wp_ensemble = ensemble_speckle(waveplate_mod, num_realizations)
+I_avg_sm, contrast_sm_avg, contrast_sm_ensemble = ensemble_speckle(soft_mask_mod, num_realizations)
+
+print("Ensemble-averaged speckle contrast (mean of individual contrasts):")
+print("  Identity (no modification): {:.2f}".format(contrast_id_avg))
+print("  Waveplate modification:      {:.2f}".format(contrast_wp_avg))
+print("  Soft mask modification:      {:.2f}".format(contrast_sm_avg))
+
+print("\nContrast computed from ensemble-averaged intensity:")
+print("  Identity (no modification): {:.2f}".format(contrast_id_ensemble))
+print("  Waveplate modification:      {:.2f}".format(contrast_wp_ensemble))
+print("  Soft mask modification:      {:.2f}".format(contrast_sm_ensemble))
+
+# ---------------------------
+# Plot the ensemble-averaged speckle patterns
+# ---------------------------
+plt.figure(figsize=(14, 4))
+
+plt.subplot(1, 3, 1)
+plt.imshow(I_avg_id, extent=[-L/2*1e3, L/2*1e3, -L/2*1e3, L/2*1e3],
+           cmap='inferno', origin='lower')
+plt.title("Ensemble Averaged (Identity)\nContrast: {:.2f}".format(contrast_id_ensemble))
+plt.xlabel("x (mm)")
+plt.ylabel("y (mm)")
+plt.colorbar()
+
+plt.subplot(1, 3, 2)
+plt.imshow(I_avg_wp, extent=[-L/2*1e3, L/2*1e3, -L/2*1e3, L/2*1e3],
+           cmap='inferno', origin='lower')
+plt.title("Ensemble Averaged (Waveplate)\nContrast: {:.2f}".format(contrast_wp_ensemble))
+plt.xlabel("x (mm)")
+plt.ylabel("y (mm)")
+plt.colorbar()
+
+plt.subplot(1, 3, 3)
+plt.imshow(I_avg_sm, extent=[-L/2*1e3, L/2*1e3, -L/2*1e3, L/2*1e3],
+           cmap='inferno', origin='lower')
+plt.title("Ensemble Averaged (Soft Mask)\nContrast: {:.2f}".format(contrast_sm_ensemble))
+plt.xlabel("x (mm)")
+plt.ylabel("y (mm)")
+plt.colorbar()
+
+plt.tight_layout()
+plt.show()
