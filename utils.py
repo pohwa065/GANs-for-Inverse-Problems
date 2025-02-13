@@ -1398,3 +1398,150 @@ plt.colorbar(ax=axs[1, 2])
 
 plt.tight_layout()
 plt.show()
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.fft import fft2, ifft2, fftshift, ifftshift
+
+def speckle_simulation_multiple_sources_masking(N, aperture_radius, oversampling=2, num_sources=3, plot_intermediate=False):
+    """
+    Generates speckle, finds brightest spot, back-propagates, masks,
+    forward propagates, calculates contrasts, and optionally plots steps.
+
+    Args:
+        N: Image size.
+        aperture_radius: Aperture radius.
+        oversampling: Oversampling factor.
+        num_sources: Number of phase sources.
+        plot_intermediate: If True, plot intermediate steps.
+
+    Returns:
+        tuple: Original and masked contrasts, mask, brightest spot coords.
+    """
+
+    # --- 1. Initial Speckle Generation ---
+    pupil_size = N * oversampling
+    x_pupil = np.linspace(-pupil_size / 2, pupil_size / 2 - 1, pupil_size)
+    y_pupil = np.linspace(-pupil_size / 2, pupil_size / 2 - 1, pupil_size)
+    X_pupil, Y_pupil = np.meshgrid(x_pupil, y_pupil)
+
+    aperture = (X_pupil**2 + Y_pupil**2) <= aperture_radius**2
+
+    E_pupil = np.zeros((pupil_size, pupil_size), dtype=complex)
+    for _ in range(num_sources):
+        random_phase = np.random.uniform(0, 2 * np.pi, size=(pupil_size, pupil_size))
+        E_pupil += aperture * np.exp(1j * random_phase)
+
+    E_image = fftshift(fft2(ifftshift(E_pupil)))
+    E_image = E_image[::oversampling, ::oversampling]
+    speckle_image = np.abs(E_image)**2
+    original_contrast = np.std(speckle_image) / np.mean(speckle_image)
+
+    # --- 2. Back-propagation and Masking ---
+    max_intensity_coords = np.unravel_index(np.argmax(speckle_image), speckle_image.shape)
+    E_image_backprop = np.zeros_like(E_image, dtype=complex)
+    E_image_backprop[max_intensity_coords] = E_image[max_intensity_coords]
+    E_pupil_backprop = fftshift(ifft2(ifftshift(E_image_backprop)))
+    E_pupil_backprop = np.pad(E_pupil_backprop,
+                                     ((pupil_size - N) // 2, (pupil_size - N) // 2 + (pupil_size-N)%2),
+                                     'constant')
+    threshold = 0.1 * np.max(np.abs(E_pupil_backprop))
+    contributing_regions = np.abs(E_pupil_backprop) > threshold
+
+    # --- 3. Apply the Mask ---
+    masked_E_pupil = E_pupil.copy()
+    masked_E_pupil[~contributing_regions] = 0  # KEY CHANGE:  ~contributing_regions
+
+    # --- 4. Forward Propagate Masked Field ---
+    masked_E_image = fftshift(fft2(ifftshift(masked_E_pupil)))
+    masked_E_image = masked_E_image[::oversampling, ::oversampling]
+    masked_speckle_image = np.abs(masked_E_image)**2
+    masked_contrast = np.std(masked_speckle_image) / np.mean(masked_speckle_image)
+
+    if plot_intermediate:
+        plt.figure(figsize=(12, 8))
+        plt.subplot(2, 3, 1)
+        plt.imshow(speckle_image, cmap='gray')
+        plt.plot(max_intensity_coords[1], max_intensity_coords[0], 'ro', markersize=5)
+        plt.title('Original Speckle')
+        plt.colorbar()
+
+        plt.subplot(2, 3, 2)
+        plt.imshow(np.abs(E_pupil), cmap='viridis')
+        plt.title('Original Pupil')
+        plt.colorbar()
+
+        plt.subplot(2, 3, 3)
+        plt.imshow(np.abs(E_pupil_backprop), cmap='viridis')
+        plt.title('Back-propagated Pupil')
+        plt.colorbar()
+
+        plt.subplot(2, 3, 4)
+        plt.imshow(contributing_regions, cmap='gray')
+        plt.title('Contributing Regions')
+        plt.colorbar()
+
+        plt.subplot(2, 3, 5)
+        plt.imshow(np.abs(masked_E_pupil), cmap='viridis')
+        plt.title('Masked Pupil')
+        plt.colorbar()
+
+        plt.subplot(2, 3, 6)
+        plt.imshow(masked_speckle_image, cmap='gray')
+        plt.title('Masked Speckle')
+        plt.colorbar()
+        plt.tight_layout()
+        plt.show()
+
+    return original_contrast, masked_contrast, contributing_regions, max_intensity_coords
+
+
+
+def main():
+    # Parameters
+    N = 256
+    aperture_radius = N / 8
+    oversampling = 2
+    num_sources_list = [1, 2, 3, 5, 10, 20]
+    num_trials = 50
+
+    for num_sources in num_sources_list:
+        original_contrasts = []
+        masked_contrasts = []
+
+        for _ in range(num_trials):
+            original_contrast, masked_contrast, contributing_regions, max_coords = speckle_simulation_multiple_sources_masking(
+                N, aperture_radius, oversampling, num_sources, plot_intermediate=False # Set to True to see plots
+            )
+            original_contrasts.append(original_contrast)
+            masked_contrasts.append(masked_contrast)
+
+        mean_original_contrast = np.mean(original_contrasts)
+        mean_masked_contrast = np.mean(masked_contrasts)
+        std_original_contrast = np.std(original_contrasts)
+        std_masked_contrast = np.std(masked_contrasts)
+        print(f"Num Sources: {num_sources}, Original Contrast: {mean_original_contrast:.4f} (±{std_original_contrast:.4f}), Masked Contrast: {mean_masked_contrast:.4f} (±{std_masked_contrast:.4f})")
+
+        # --- Analyze the bright spot in the masked image ---
+
+        # Find the brightest spot *after* masking.
+        max_intensity_coords_masked = np.unravel_index(np.argmax(masked_speckle_image), masked_speckle_image.shape)
+        print(f"  Brightest spot in masked image: {max_intensity_coords_masked}")
+
+        # Check if the original brightest spot is *still* the brightest after masking.
+        if max_intensity_coords_masked == tuple(max_intensity_coords):
+            print("  The original brightest spot remains the brightest after masking.")
+        else:
+            print("  The original brightest spot is NOT the brightest after masking.")
+
+        # Calculate the intensity ratio
+        original_max_intensity = speckle_image[max_intensity_coords]
+        masked_max_intensity = masked_speckle_image[max_intensity_coords_masked] #use new coords
+
+        print(f"  Intensity Ratio (Masked Max / Original Max): {masked_max_intensity / original_max_intensity:.4f}")
+        print("-" * 40)
+
+
+if __name__ == "__main__":
+    main()
