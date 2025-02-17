@@ -1545,3 +1545,168 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
+    
+import numpy as np
+import matplotlib.pyplot as plt
+import scipy.ndimage as ndimage
+
+"""
+Refined Speckle Photography Simulation and Analysis
+Based on Goodman's "Speckle Phenomena in Optics" (Sections 9.1.1–9.1.4 / 9.11–9.14)
+
+This script performs:
+  1. Generation of an initial speckle field (random phase, unit amplitude).
+  2. Simulation of in-plane displacement by shifting the speckle field.
+  3. Formation of a double-exposure image (sum of intensities).
+  4. Measurement of displacement via 2D cross-correlation.
+  5. Fourier analysis of the double-exposure image to reveal fringe structure.
+  6. An exploration of how increasing the displacement degrades correlation.
+  
+Author: [Your Name], 2025
+"""
+
+# ==============================
+# 1. Generate an Initial Speckle Field
+# ==============================
+N = 512  # image size (NxN pixels)
+np.random.seed(0)
+
+# Create a speckle field: unit amplitude with random phase uniformly distributed in [0, 2π)
+phase = 2 * np.pi * np.random.rand(N, N)
+speckle_field = np.exp(1j * phase)
+intensity1 = np.abs(speckle_field)**2  # should be nearly uniform (intensity ~1)
+
+# ==============================
+# 2. Simulate In-Plane Displacement (Section 9.1.1 and 9.1.2)
+# ==============================
+def shift_speckle(field, shift_x, shift_y):
+    """
+    Shift a complex speckle field by (shift_x, shift_y) pixels.
+    Uses ndimage.shift with wrap-around (simulating periodic boundaries).
+    """
+    return ndimage.shift(field, shift=(shift_y, shift_x), order=1, mode='wrap')
+
+# Choose a displacement (in pixels)
+displacement = (16, 16)  # (shift_x, shift_y)
+speckle_field_shifted = shift_speckle(speckle_field, *displacement)
+intensity2 = np.abs(speckle_field_shifted)**2
+
+# Form the double-exposure image by adding the intensities (Section 9.1.2)
+double_exposure = intensity1 + intensity2
+
+# ==============================
+# 3. In-Plane Displacement Measurement via Cross-Correlation (Section 9.1.1)
+# ==============================
+def cross_correlation_displacement(int_img1, int_img2):
+    """
+    Compute the 2D cross-correlation between two intensity images and return the displacement.
+    Uses FFT-based cross-correlation.
+    """
+    fft1 = np.fft.fft2(int_img1)
+    fft2 = np.fft.fft2(int_img2)
+    cross_spec = fft1 * np.conjugate(fft2)
+    cross_corr = np.fft.ifft2(cross_spec)
+    cross_corr_shifted = np.fft.fftshift(cross_corr)
+    mag_corr = np.abs(cross_corr_shifted)
+    
+    # Locate the peak in the correlation map
+    peak_y, peak_x = np.unravel_index(np.argmax(mag_corr), mag_corr.shape)
+    center_y, center_x = int_img1.shape[0] // 2, int_img1.shape[1] // 2
+    # The displacement is the difference between the peak and the center
+    est_shift_y = peak_y - center_y
+    est_shift_x = peak_x - center_x
+    return (est_shift_y, est_shift_x), mag_corr
+
+(est_shift_y, est_shift_x), crosscorr_map = cross_correlation_displacement(intensity1, intensity2)
+print("Actual displacement (pixels): (y, x) =", (displacement[1], displacement[0]))
+print("Estimated displacement from cross-correlation (pixels): (y, x) = ({:.2f}, {:.2f})".format(est_shift_y, est_shift_x))
+
+# ==============================
+# 4. Fourier Analysis of the Double-Exposure Image (Section 9.1.3)
+# ==============================
+# Compute the 2D Fourier transform (FT) of the double-exposure image
+FT_double_exposure = np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(double_exposure)))
+spectrum_double_exposure = np.abs(FT_double_exposure)**2
+
+# ==============================
+# 5. Explore Limitations with Increasing Displacement (Section 9.1.4)
+# ==============================
+# We test a range of displacements and record the cross-correlation results.
+displacements = [(4,4), (16,16), (32,32), (64,64), (128,128)]
+results = []
+for sx, sy in displacements:
+    shifted_field = shift_speckle(speckle_field, sx, sy)
+    intensity_shifted = np.abs(shifted_field)**2
+    # For cross-correlation, we compare the original intensity to the shifted one.
+    (dy_est, dx_est), cc_map = cross_correlation_displacement(intensity1, intensity_shifted)
+    results.append(((sx, sy), (dx_est, dy_est), cc_map))
+
+# ==============================
+# 6. Visualization
+# ==============================
+fig, axes = plt.subplots(3, 3, figsize=(14, 12))
+fig.suptitle("Speckle Photography Simulation & Analysis\n(Sections 9.1.1–9.1.4)", fontsize=16)
+
+# (a) Original speckle intensity
+axes[0,0].imshow(intensity1, cmap='gray')
+axes[0,0].set_title("Speckle Intensity 1")
+axes[0,0].axis('off')
+
+# (b) Shifted speckle intensity for the chosen displacement
+axes[0,1].imshow(intensity2, cmap='gray')
+axes[0,1].set_title(f"Shifted Intensity (Shift={displacement})")
+axes[0,1].axis('off')
+
+# (c) Double-exposure image
+axes[0,2].imshow(double_exposure, cmap='gray')
+axes[0,2].set_title("Double-Exposure Image")
+axes[0,2].axis('off')
+
+# (d) Cross-correlation map from the chosen displacement
+axes[1,0].imshow(crosscorr_map, cmap='jet')
+axes[1,0].set_title("Cross-Correlation Map")
+axes[1,0].axis('off')
+
+# (e) Log spectrum of the double-exposure (revealing fringes)
+axes[1,1].imshow(np.log10(1 + spectrum_double_exposure), cmap='jet')
+axes[1,1].set_title("log10|FT(Double-Exposure)|²")
+axes[1,1].axis('off')
+
+# (f) 1D slice through the center of the spectrum
+center_line = spectrum_double_exposure[N//2, :]
+axes[1,2].plot(np.log10(1 + center_line), 'b-')
+axes[1,2].set_title("1D Spectrum Slice")
+axes[1,2].set_xlabel("Spatial frequency index")
+axes[1,2].set_ylabel("log10 intensity")
+
+# (g) Display cross-correlation estimates for various displacements
+axes[2,0].axis('off')
+axes[2,0].text(0.05, 0.5, "Displacement Estimates:\n", fontsize=12)
+for (true_disp, est_disp, _) in results:
+    axes[2,0].text(0.05, 0.5, f"True: {true_disp}, Estimated: ({est_disp[0]:.1f},{est_disp[1]:.1f})\n", fontsize=10)
+
+# (h) Example: Show cross-correlation map for a larger displacement (e.g., 64,64)
+example_idx = 3  # corresponds to shift (64,64)
+axes[2,1].imshow(results[example_idx][2], cmap='jet')
+axes[2,1].set_title("Cross-Corr Map (Shift = (64,64))")
+axes[2,1].axis('off')
+
+# (i) Example: Show double-exposure image for a larger displacement (e.g., 128,128)
+shift_large = displacements[-1]
+shifted_field_large = shift_speckle(speckle_field, *shift_large)
+intensity_large = np.abs(shifted_field_large)**2
+double_exposure_large = intensity1 + intensity_large
+axes[2,2].imshow(double_exposure_large, cmap='gray')
+axes[2,2].set_title("Double-Exposure (Shift = (128,128))")
+axes[2,2].axis('off')
+
+plt.tight_layout(rect=[0, 0, 1, 0.96])
+plt.show()
+
+# ==============================
+# Summary of Results
+# ==============================
+print("\nDisplacement Estimation Summary:")
+for (true_disp, est_disp, _) in results:
+    print(f" True shift = {true_disp}; Estimated shift = ({est_disp[0]:.2f}, {est_disp[1]:.2f})")
