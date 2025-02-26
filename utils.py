@@ -1711,3 +1711,803 @@ print("\nDisplacement Estimation Summary:")
 for (true_disp, est_disp, _) in results:
     print(f" True shift = {true_disp}; Estimated shift = ({est_disp[0]:.2f}, {est_disp[1]:.2f})")
 
+
+
+
+
+
+
+import math
+import numpy as np
+import torch
+import torch.nn.functional as F
+import torch.fft
+import abc
+import poppy  # Used for zernike_basis; ensure this dependency is available
+
+##############################
+# Helper functions
+##############################
+
+def get_zernike_volume(resolution, n_terms, scale_factor=1e-6):
+    # poppy.zernike.zernike_basis returns a numpy array.
+    zernike_volume = poppy.zernike.zernike_basis(nterms=n_terms, npix=resolution, outside=0.0)
+    # Convert to a torch tensor
+    return torch.tensor(zernike_volume * scale_factor, dtype=torch.float32)
+
+def fspecial(shape=(3, 3), sigma=0.5):
+    """
+    2D gaussian mask similar to MATLAB's fspecial('gaussian',[shape],[sigma]).
+    Returns a torch.Tensor.
+    """
+    m, n = [(ss - 1.) / 2. for ss in shape]
+    y, x = np.ogrid[-m:m + 1, -n:n + 1]
+    h = np.exp(-(x * x + y * y) / (2. * sigma * sigma))
+    h[h < np.finfo(h.dtype).eps * h.max()] = 0
+    sumh = h.sum()
+    if sumh != 0:
+        h /= sumh
+    return torch.tensor(h, dtype=torch.float32)
+
+def zoom(image_batch, zoom_fraction):
+    """
+    Get central crop of a batch.
+    Assumes image_batch is (batch, channels, H, W) and performs a center crop.
+    """
+    b, c, H, W = image_batch.shape
+    new_H, new_W = int(H * zoom_fraction), int(W * zoom_fraction)
+    top = (H - new_H) // 2
+    left = (W - new_W) // 2
+    return image_batch[:, :, top:top+new_H, left:left+new_W]
+
+def fft2d(a_tensor):
+    """
+    Computes the 2D FFT on the last two dimensions.
+    Expects input tensor with shape (batch, channels, H, W).
+    """
+    if not torch.is_complex(a_tensor):
+        a_tensor = a_tensor.to(torch.complex64)
+    return torch.fft.fft2(a_tensor)
+
+def ifft2d(a_tensor):
+    """
+    Computes the 2D inverse FFT.
+    """
+    return torch.fft.ifft2(a_tensor)
+
+def compl_exp(phase, dtype=torch.complex64):
+    """
+    Compute complex exponential via Euler's formula.
+    """
+    # One may also use: torch.exp(1j * phase)
+    phase = phase.to(torch.float64)
+    return (torch.cos(phase).to(dtype) + 1j * torch.sin(phase).to(dtype))
+
+def laplacian_filter_torch(img_batch):
+    """
+    Applies a Laplacian filter (including diagonals) to a batch of images.
+    Expects input in shape (batch, channels, H, W).
+    """
+    device = img_batch.device
+    laplacian_kernel = torch.tensor([[1, 1, 1],
+                                     [1, -8, 1],
+                                     [1, 1, 1]], dtype=torch.float32, device=device)
+    # Reshape to (1, 1, 3, 3)
+    laplacian_kernel = laplacian_kernel.view(1, 1, 3, 3)
+    channels = img_batch.shape[1]
+    # Use groups to apply the same filter to each channel
+    kernel = laplacian_kernel.repeat(channels, 1, 1, 1)
+    return F.conv2d(img_batch.float(), kernel, padding=1, groups=channels)
+
+def laplace_l1_regularizer(scale):
+    if math.isclose(scale, 0.0):
+        print("Scale of zero disables the laplace_l1_regularizer.")
+    def laplace_l1(a_tensor):
+        laplace_filtered = laplacian_filter_torch(a_tensor)
+        # Crop border (similar to slicing [1:-1,1:-1])
+        laplace_filtered = laplace_filtered[:, :, 1:-1, 1:-1]
+        return scale * torch.mean(torch.abs(laplace_filtered))
+    return laplace_l1
+
+def laplace_l2_regularizer(scale):
+    if math.isclose(scale, 0.0):
+        print("Scale of zero disables the laplace_l2_regularizer.")
+    def laplace_l2(a_tensor):
+        laplace_filtered = laplacian_filter_torch(a_tensor)
+        laplace_filtered = laplace_filtered[:, :, 1:-1, 1:-1]
+        return scale * torch.mean(laplace_filtered ** 2)
+    return laplace_l2
+
+# (Optional) You can add logging via TensorBoard if desired.
+def attach_summaries(name, var):
+    # Placeholder: in PyTorch one might use torch.utils.tensorboard.SummaryWriter.
+    pass
+
+def fftshift2d_torch(x):
+    """
+    Shift the zero-frequency component to the center.
+    Uses torch.fft.fftshift (available in PyTorch ≥ 1.8).
+    """
+    return torch.fft.fftshift(x, dim=(-2, -1))
+
+def ifftshift2d_torch(x):
+    """
+    Inverse FFT shift.
+    """
+    return torch.fft.ifftshift(x, dim=(-2, -1))
+
+def psf2otf(input_filter, output_size):
+    """
+    Convert a PSF (assumed to be a torch.Tensor of shape
+    (channels, channels, height, width)) into its OTF.
+    """
+    # Get filter dimensions
+    _, _, fh, fw = input_filter.shape
+    out_h, out_w = output_size
+
+    # Compute required padding along height and width
+    pad_h = out_h - fh
+    pad_w = out_w - fw
+    pad_top = int(np.ceil(pad_h / 2))
+    pad_bottom = int(np.floor(pad_h / 2))
+    pad_left = int(np.ceil(pad_w / 2))
+    pad_right = int(np.floor(pad_w / 2))
+    padded = F.pad(input_filter, (pad_left, pad_right, pad_top, pad_bottom))
+    # Apply inverse shift so that the center pixel moves to (0,0)
+    padded = ifftshift2d_torch(padded)
+    # Compute FFT on spatial dims
+    otf = torch.fft.fft2(padded)
+    return otf
+
+def next_power_of_two(number):
+    return 2 ** int(np.ceil(np.log2(number)))
+
+def img_psf_conv(img, psf, otf=None, adjoint=False, circular=False):
+    """
+    Convolve an image with a PSF in the Fourier domain.
+    Assumes:
+      - img: (batch, channels, H, W)
+      - psf: (channels, channels, kH, kW)
+    """
+    # Ensure img and psf are floats
+    img = img.float()
+    psf = psf.float()
+    batch, channels, H, W = img.shape
+    if not circular:
+        target_side = 2 * H  # assuming square images
+        pad_h = target_side - H
+        pad_w = target_side - W
+        pad_top = int(np.ceil(pad_h / 2))
+        pad_bottom = int(np.floor(pad_h / 2))
+        pad_left = int(np.ceil(pad_w / 2))
+        pad_right = int(np.floor(pad_w / 2))
+        img = F.pad(img, (pad_left, pad_right, pad_top, pad_bottom))
+    # FFT of the image
+    img_fft = torch.fft.fft2(img)
+    if otf is None:
+        otf = psf2otf(psf, output_size=img.shape[-2:])
+    if adjoint:
+        result_fft = img_fft * torch.conj(otf)
+    else:
+        result_fft = img_fft * otf
+    result = torch.fft.ifft2(result_fft).real
+    if not circular:
+        result = result[:, :, pad_top:-pad_bottom, pad_left:-pad_right]
+    return result
+
+def depth_dep_convolution(img, psfs, disc_depth_map):
+    """
+    Convolve an image with different PSFs at different depths as determined
+    by a discretized depth map.
+    - img: (batch, channels, H, W)
+    - psfs: an iterable (or list) of PSFs; each is (channels, channels, kH, kW)
+    - disc_depth_map: (batch, H, W) with integer indices.
+    """
+    if disc_depth_map.dim() == 3:
+        disc_depth_map = disc_depth_map.unsqueeze(1)  # shape: (batch, 1, H, W)
+    zeros_tensor = torch.zeros_like(img)
+    blurred_imgs = []
+    batch, channels, H, W = img.shape
+    for depth_idx, psf in enumerate(psfs):
+        blurred_img = img_psf_conv(img, psf)
+        condition = (disc_depth_map == depth_idx)  # boolean tensor, shape: (batch, 1, H, W)
+        condition = condition.expand_as(blurred_img)
+        blurred_imgs.append(torch.where(condition, blurred_img, zeros_tensor))
+    result = sum(blurred_imgs)
+    return result
+
+def get_spherical_wavefront_phase(resolution, physical_size, wave_lengths, source_distance):
+    """
+    Generate the spherical wavefront phase.
+    Returns a tensor of shape (1, num_wavelengths, N, M).
+    """
+    N, M = resolution
+    # Create coordinate grid in double precision
+    y, x = torch.meshgrid(
+        torch.arange(-N // 2, N // 2, dtype=torch.float64),
+        torch.arange(-M // 2, M // 2, dtype=torch.float64),
+        indexing='xy'
+    )
+    x = x / N * physical_size
+    y = y / M * physical_size
+    curvature = torch.sqrt(x**2 + y**2 + source_distance**2)
+    wave_lengths_tensor = torch.tensor(wave_lengths, dtype=torch.float64)
+    # Compute phase shifts for each wavelength: shape (num_wavelengths, N, M)
+    phase_shifts = compl_exp(wave_lengths_tensor.view(-1, 1, 1).reciprocal() * (2 * np.pi) * curvature)
+    # Expand to add batch dimension: final shape (1, num_wavelengths, N, M)
+    phase_shifts = phase_shifts.unsqueeze(0)
+    return phase_shifts
+
+def least_common_multiple(a, b):
+    return abs(a * b) // math.gcd(a, b) if a and b else 0
+
+def area_downsampling_torch(input_image, target_side_length):
+    """
+    Downsample an image using area averaging.
+    Expects input_image of shape (batch, channels, H, W).
+    """
+    batch, channels, H, W = input_image.shape
+    if H % target_side_length == 0:
+        factor = H // target_side_length
+        output_img = F.avg_pool2d(input_image, kernel_size=factor, stride=factor)
+    else:
+        lcm_factor = least_common_multiple(target_side_length, H) // target_side_length
+        if lcm_factor > 10:
+            print("Warning: area downsampling is very expensive and not precise if source and target dimensions have a large LCM")
+            upsample_factor = 10
+        else:
+            upsample_factor = lcm_factor
+        new_size = (2 * upsample_factor * target_side_length, 2 * upsample_factor * target_side_length)
+        img_upsampled = F.interpolate(input_image, size=new_size, mode='nearest')
+        output_img = F.avg_pool2d(img_upsampled, kernel_size=upsample_factor, stride=upsample_factor)
+    return output_img
+
+def get_intensities(input_field):
+    return torch.abs(input_field) ** 2
+
+##################################
+# Optical elements & Propagation
+##################################
+
+class Propagation(abc.ABC):
+    def __init__(self, input_shape, distance, discretization_size, wave_lengths):
+        self.input_shape = input_shape
+        self.distance = distance
+        self.wave_lengths = wave_lengths
+        self.wave_nos = 2 * np.pi / np.array(wave_lengths)
+        self.discretization_size = discretization_size
+
+    @abc.abstractmethod
+    def _propagate(self, input_field):
+        """Propagate an input field through the medium."""
+        pass
+
+    def __call__(self, input_field):
+        return self._propagate(input_field)
+
+class FresnelPropagation(Propagation):
+    def _propagate(self, input_field):
+        # Expect input_field shape: (batch, channels, H, W)
+        batch, channels, H_orig, W_orig = input_field.shape
+        # Zero padding (pad 1/4 on each side)
+        Mpad = H_orig // 4
+        Npad = W_orig // 4
+        padded_input_field = F.pad(input_field, (Npad, Npad, Mpad, Mpad))
+        # Get padded dimensions
+        _, _, H, W = padded_input_field.shape
+        # Create spatial frequency grid (double precision)
+        x = torch.linspace(-W//2, W//2 - 1, W, dtype=torch.float64, device=input_field.device)
+        y = torch.linspace(-H//2, H//2 - 1, H, dtype=torch.float64, device=input_field.device)
+        x, y = torch.meshgrid(x, y, indexing='xy')
+        # Compute frequencies
+        fx = x / (self.discretization_size * W)
+        fy = y / (self.discretization_size * H)
+        # Apply ifftshift (to match MATLAB/TensorFlow behavior)
+        fx = ifftshift2d_torch(fx)
+        fy = ifftshift2d_torch(fy)
+        # Expand dims so that fx, fy become (1, 1, H, W)
+        fx = fx.unsqueeze(0).unsqueeze(0)
+        fy = fy.unsqueeze(0).unsqueeze(0)
+        squared_sum = fx**2 + fy**2  # shape: (1,1,H,W)
+        # Assume each channel corresponds to one wavelength.
+        wave_lengths_tensor = torch.tensor(self.wave_lengths, dtype=torch.float64, device=input_field.device)
+        # Expand squared_sum to (1, channels, H, W)
+        squared_sum = squared_sum.expand(1, channels, -1, -1)
+        # Compute the constant exponent part: (1, channels, H, W)
+        tmp = wave_lengths_tensor.view(1, channels, 1, 1) * np.pi * -1.0 * squared_sum
+        # Compute the Fresnel kernel H = exp(1j * distance * tmp)
+        H_kernel = compl_exp(tmp * self.distance)
+        # Ensure input field is complex
+        if not torch.is_complex(padded_input_field):
+            padded_input_field = padded_input_field.to(torch.complex64)
+        # Propagate via FFT
+        objFT = torch.fft.fft2(padded_input_field)
+        out_field = torch.fft.ifft2(objFT * H_kernel)
+        # Crop back to original size
+        out_field = out_field[:, :, Mpad:-Mpad, Npad:-Npad]
+        return out_field
+
+class PhasePlate:
+    def __init__(self, wave_lengths, height_map, refractive_idcs,
+                 height_tolerance=None, lateral_tolerance=None):
+        """
+        - height_map: a torch.Tensor of shape (H, W)
+        - wave_lengths: list or array of wavelengths.
+        - refractive_idcs: list/array of refractive indices.
+        """
+        self.wave_lengths = wave_lengths
+        self.height_map = height_map  # expected as torch.Tensor
+        self.refractive_idcs = refractive_idcs
+        self.height_tolerance = height_tolerance
+        self.lateral_tolerance = lateral_tolerance
+        self._build()
+
+    def _build(self):
+        # Add manufacturing tolerances as random noise if specified
+        if self.height_tolerance is not None:
+            noise = (torch.rand_like(self.height_map) * 2 - 1) * self.height_tolerance
+            self.height_map = self.height_map + noise
+            print("Phase plate with manufacturing tolerance %0.2e" % self.height_tolerance)
+        self.phase_shifts = phaseshifts_from_height_map(self.height_map,
+                                                        self.wave_lengths,
+                                                        self.refractive_idcs)
+
+    def __call__(self, input_field):
+        if not torch.is_complex(input_field):
+            input_field = input_field.to(torch.complex64)
+        return input_field * self.phase_shifts
+
+def phaseshifts_from_height_map(height_map, wave_lengths, refractive_idcs):
+    """
+    Calculates the phase shifts created by a height map.
+    - height_map: (H, W) torch.Tensor.
+    Returns a tensor of shape (1, num_wavelengths, H, W).
+    """
+    H, W = height_map.shape
+    # Expand to (1, H, W, 1) for broadcasting
+    height_map = height_map.unsqueeze(0).unsqueeze(-1)
+    wave_lengths_tensor = torch.tensor(wave_lengths, dtype=height_map.dtype, device=height_map.device)
+    refractive_idcs_tensor = torch.tensor(refractive_idcs, dtype=height_map.dtype, device=height_map.device)
+    delta_N = refractive_idcs_tensor.view(1, 1, 1, -1) - 1.0
+    wave_nos = 2 * np.pi / wave_lengths_tensor
+    wave_nos = wave_nos.view(1, 1, 1, -1)
+    phi = wave_nos * delta_N * height_map
+    # Compute complex exponent and rearrange to (1, num_wavelengths, H, W)
+    phase_shifts = compl_exp(phi)
+    phase_shifts = phase_shifts.permute(0, 3, 1, 2)
+    return phase_shifts
+
+def get_one_phase_shift_thickness(wave_lengths, refractive_index):
+    wave_lengths_tensor = torch.tensor(wave_lengths, dtype=torch.float64)
+    delta_N = refractive_index - 1.0
+    wave_nos = 2 * np.pi / wave_lengths_tensor
+    two_pi_thickness = (2 * np.pi) / (wave_nos * delta_N)
+    return two_pi_thickness
+
+def propagate_exact(input_field, distance, input_sample_interval, wave_lengths):
+    """
+    An "exact" propagation method using FFT.
+    Similar in structure to FresnelPropagation.
+    """
+    batch, channels, H_orig, W_orig = input_field.shape
+    Mpad = H_orig // 4
+    Npad = W_orig // 4
+    padded_input_field = F.pad(input_field, (Npad, Npad, Mpad, Mpad))
+    _, _, H, W = padded_input_field.shape
+    x = torch.linspace(-W//2, W//2 - 1, W, dtype=torch.float64, device=input_field.device)
+    y = torch.linspace(-H//2, H//2 - 1, H, dtype=torch.float64, device=input_field.device)
+    x, y = torch.meshgrid(x, y, indexing='xy')
+    fx = x / (input_sample_interval * W)
+    fy = y / (input_sample_interval * H)
+    fx = ifftshift2d_torch(fx).unsqueeze(0).unsqueeze(0)
+    fy = ifftshift2d_torch(fy).unsqueeze(0).unsqueeze(0)
+    squared_sum = fx**2 + fy**2
+    wave_lengths_tensor = torch.tensor(wave_lengths, dtype=torch.float64, device=input_field.device)
+    squared_sum = squared_sum.expand(1, channels, -1, -1)
+    tmp = wave_lengths_tensor.view(1, channels, 1, 1) * np.pi * -1.0 * squared_sum
+    H_kernel = compl_exp(tmp * distance)
+    objFT = torch.fft.fft2(padded_input_field)
+    out_field = torch.fft.ifft2(objFT * H_kernel)
+    out_field = out_field[:, :, Mpad:-Mpad, Npad:-Npad]
+    return out_field
+
+import math
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.fft
+
+# ------------------------------------------------------------------------------
+# Simple helper functions already converted earlier:
+#   - propagate_fresnel (via FresnelPropagation)
+#   - PhasePlate, FresnelPropagation,
+#   - img_psf_conv, area_downsampling_torch, depth_dep_convolution,
+#   - fftshift2d_torch, ifftshift2d_torch, compl_exp, get_intensities,
+#   - gaussian_noise (see below)
+# ------------------------------------------------------------------------------
+
+def propagate_fresnel(input_field, distance, sampling_interval, wave_lengths):
+    """
+    Wraps the FresnelPropagation class.
+    """
+    input_shape = input_field.shape  # (batch, channels, H, W)
+    propagation = FresnelPropagation(input_shape,
+                                     distance=distance,
+                                     discretization_size=sampling_interval,
+                                     wave_lengths=wave_lengths)
+    return propagation(input_field)
+
+def circular_aperture(input_field):
+    """
+    Applies a circular aperture mask to the input field.
+    Assumes input_field shape: (batch, channels, H, W)
+    """
+    batch, channels, H, W = input_field.shape
+    # Create a coordinate grid over (H, W)
+    x, y = np.mgrid[-H//2:H//2, -W//2:W//2]
+    max_val = np.max(np.abs(x))
+    # Compute radius; shape (1, 1, H, W)
+    r = np.sqrt(x**2 + y**2)[None, None, :, :]
+    aperture = (r < max_val).astype(np.float32)
+    aperture = torch.tensor(aperture, device=input_field.device)
+    return input_field * aperture
+
+def gaussian_noise(image, stddev=0.001):
+    """
+    Adds additive Gaussian noise.
+    """
+    return image + torch.randn_like(image) * stddev
+
+def get_vanilla_height_map(side_length, height_map_regularizer=None, name='height_map'):
+    """
+    Returns a default height map tensor of shape (1, 1, side_length, side_length)
+    with constant value 1e-4.
+    """
+    height_map = torch.ones((1, 1, side_length, side_length), dtype=torch.float64) * 1e-4
+    # In PyTorch, regularization and summaries are applied externally.
+    return height_map
+
+class FourierHeightMap(nn.Module):
+    """
+    Returns a height map generated from learnable Fourier-domain coefficients.
+    """
+    def __init__(self, side_length, frequency_range=0.5, height_map_regularizer=None):
+        super(FourierHeightMap, self).__init__()
+        self.side_length = side_length
+        self.freq_size = int(side_length * frequency_range)
+        # Parameter shape: (1, 1, freq_size, freq_size)
+        self.fourier_coeffs = nn.Parameter(torch.zeros(1, 1, self.freq_size, self.freq_size, dtype=torch.float32))
+        self.height_map_regularizer = height_map_regularizer
+
+    def forward(self):
+        pad = (self.side_length - self.freq_size) // 2
+        fourier_coeffs_padded = F.pad(self.fourier_coeffs, (pad, pad, pad, pad))
+        # Shift so that the center moves to (0,0)
+        fourier_coeffs_padded = ifftshift2d_torch(fourier_coeffs_padded)
+        height_map_complex = torch.fft.ifft2(fourier_coeffs_padded)
+        height_map = height_map_complex.real
+        return height_map
+
+# ------------------------------------------------------------------------------
+# Modules that encapsulate optical elements with learnable parameters.
+# In TensorFlow these were defined via get_variable and variable_scope;
+# in PyTorch we define them as nn.Module subclasses.
+# ------------------------------------------------------------------------------
+
+class HeightMapElement(nn.Module):
+    """
+    Learns a height map in the spatial domain.
+    
+    The parameter is stored as the square root of the height map so that the 
+    physical height is given by its square.
+    """
+    def __init__(self, input_field_shape, wave_lengths, refractive_idcs,
+                 block_size=1, height_map_initializer=None, height_tolerance=None):
+        super(HeightMapElement, self).__init__()
+        # input_field_shape is (batch, channels, H, W)
+        _, _, H, W = input_field_shape
+        self.out_shape = (1, 1, H // block_size, W // block_size)
+        if height_map_initializer is None:
+            init_value = torch.ones(self.out_shape, dtype=torch.float64) * 1e-4
+        else:
+            init_value = height_map_initializer(self.out_shape)
+        self.height_map_sqrt = nn.Parameter(init_value)
+        self.wave_lengths = wave_lengths
+        self.refractive_idcs = refractive_idcs
+        self.height_tolerance = height_tolerance
+
+    def forward(self, input_field):
+        # Compute height map = (parameter)^2
+        height_map = self.height_map_sqrt ** 2  # shape: (1,1,H//block_size, W//block_size)
+        # Upsample to the resolution of input_field if necessary:
+        _, _, H, W = input_field.shape
+        if height_map.shape[2] != H or height_map.shape[3] != W:
+            height_map = F.interpolate(height_map, size=(H, W), mode='nearest')
+        element = PhasePlate(wave_lengths=self.wave_lengths,
+                             height_map=height_map,
+                             refractive_idcs=self.refractive_idcs,
+                             height_tolerance=self.height_tolerance)
+        return element(input_field)
+
+class FourierElement(nn.Module):
+    """
+    Learns a height map in the Fourier domain.
+    """
+    def __init__(self, input_field_shape, wave_lengths, refractive_idcs,
+                 frequency_range=0.5, height_tolerance=None, height_map_regularizer=None):
+        super(FourierElement, self).__init__()
+        _, _, H, W = input_field_shape
+        self.H, self.W = H, W
+        self.freq_H = int(H * frequency_range)
+        self.freq_W = int(W * frequency_range)
+        # Parameter shape: (1, 1, freq_H, freq_W)
+        self.fourier_coeffs = nn.Parameter(torch.zeros(1, 1, self.freq_H, self.freq_W, dtype=torch.float32))
+        self.wave_lengths = wave_lengths
+        self.refractive_idcs = refractive_idcs
+        self.height_tolerance = height_tolerance
+        self.height_map_regularizer = height_map_regularizer
+
+    def forward(self, input_field):
+        pad_h = (self.H - self.freq_H) // 2
+        pad_w = (self.W - self.freq_W) // 2
+        fourier_coeffs_padded = F.pad(self.fourier_coeffs, (pad_w, pad_w, pad_h, pad_h))
+        fourier_coeffs_padded = ifftshift2d_torch(fourier_coeffs_padded)
+        height_map_complex = torch.fft.ifft2(fourier_coeffs_padded)
+        height_map = height_map_complex.real
+        element = PhasePlate(wave_lengths=self.wave_lengths,
+                             height_map=height_map,
+                             refractive_idcs=self.refractive_idcs,
+                             height_tolerance=self.height_tolerance)
+        return element(input_field)
+
+class ZernikeElement(nn.Module):
+    """
+    Learns a height map using a Zernike basis.
+    The zernike_volume is assumed to be a tensor of shape (num_basis, H, W).
+    """
+    def __init__(self, input_field_shape, zernike_volume, wave_lengths, refractive_idcs,
+                 height_tolerance=None, zernike_initializer=None, zernike_scale=1e5, height_map_regularizer=None):
+        super(ZernikeElement, self).__init__()
+        # input_field_shape: (batch, channels, H, W)
+        _, _, H, W = input_field_shape
+        # Save the zernike volume as a fixed buffer.
+        self.register_buffer('zernike_volume', zernike_volume)  # shape: (num_basis, H, W)
+        self.num_basis = zernike_volume.shape[0]
+        if zernike_initializer is None:
+            init_value = torch.zeros((self.num_basis, 1, 1), dtype=torch.float32)
+        else:
+            init_value = zernike_initializer((self.num_basis, 1, 1))
+        self.zernike_coeffs = nn.Parameter(init_value)
+        # Apply a mask: zero out the first coefficient and scale.
+        mask = torch.ones((self.num_basis, 1, 1), dtype=torch.float32)
+        mask[0] = 0.
+        self.zernike_coeffs.data = self.zernike_coeffs.data * mask / zernike_scale
+        self.wave_lengths = wave_lengths
+        self.refractive_idcs = refractive_idcs
+        self.height_tolerance = height_tolerance
+        self.height_map_regularizer = height_map_regularizer
+
+    def forward(self, input_field):
+        # Compute the height map as a weighted sum of the zernike basis.
+        # zernike_volume: (num_basis, H, W); zernike_coeffs: (num_basis, 1, 1)
+        height_map = torch.sum(self.zernike_coeffs * self.zernike_volume, dim=0, keepdim=True)
+        # Expand to (1, 1, H, W) if needed.
+        if height_map.dim() == 3:
+            height_map = height_map.unsqueeze(1)
+        element = PhasePlate(wave_lengths=self.wave_lengths,
+                             height_map=height_map,
+                             refractive_idcs=self.refractive_idcs,
+                             height_tolerance=self.height_tolerance)
+        return element(input_field)
+
+# ------------------------------------------------------------------------------
+# Classes that mimic complete optical system setups.
+# ------------------------------------------------------------------------------
+
+class SingleLensSetup:
+    """
+    Simulates a single-lens system.
+    
+    This class sets up the optical element, computes the PSFs (point spread functions)
+    for a range of source distances (or a single planar incidence), and provides a method
+    to obtain the sensor image given an input scene.
+    """
+    def __init__(self,
+                 height_map,  # Expected to be a tensor (1, 1, H, W)
+                 wave_resolution,  # Tuple (H, W)
+                 wave_lengths,
+                 sensor_distance,
+                 sensor_resolution,  # Tuple (H, W)
+                 input_sample_interval,
+                 refractive_idcs,
+                 height_tolerance,
+                 noise_model=gaussian_noise,
+                 psf_resolution=None,
+                 target_distance=None,
+                 use_planar_incidence=True,
+                 upsample=True,
+                 depth_bins=None):
+        self.wave_resolution = wave_resolution
+        self.psf_resolution = psf_resolution if psf_resolution is not None else wave_resolution
+        self.wave_lengths = wave_lengths
+        self.refractive_idcs = refractive_idcs
+        self.sensor_distance = sensor_distance
+        self.noise_model = noise_model
+        self.sensor_resolution = sensor_resolution
+        self.input_sample_interval = input_sample_interval
+        self.use_planar_incidence = use_planar_incidence
+        self.upsample = upsample
+        self.target_distance = target_distance
+        self.depth_bins = depth_bins
+        self.height_tolerance = height_tolerance
+        self.height_map = height_map
+        self.physical_size = float(self.wave_resolution[0] * self.input_sample_interval)
+        self.pixel_size = self.input_sample_interval * np.array(wave_resolution) / np.array(sensor_resolution)
+        print("Physical size is %0.2e.\nWave resolution is %d." % (self.physical_size, self.wave_resolution[0]))
+        self.optical_element = PhasePlate(wave_lengths=self.wave_lengths,
+                                          height_map=self.height_map,
+                                          refractive_idcs=self.refractive_idcs,
+                                          height_tolerance=self.height_tolerance)
+        self.get_psfs()
+
+    def get_psfs(self):
+        if self.use_planar_incidence:
+            # Create a planar (uniform) input field: shape (1, 1, H, W)
+            input_fields = [torch.ones((1, 1, *self.wave_resolution), dtype=torch.float32, device=self.height_map.device)]
+        else:
+            distances = list(self.depth_bins) if self.depth_bins is not None else []
+            if self.target_distance is not None:
+                distances.append(self.target_distance)
+            N, M = self.wave_resolution
+            y, x = np.mgrid[-N//2:N//2, -M//2:M//2].astype(np.float64)
+            x = x / N * self.physical_size
+            y = y / M * self.physical_size
+            squared_sum = x**2 + y**2
+            wave_nos = 2 * np.pi / np.array(self.wave_lengths)
+            # Create one input field per distance (for each wavelength, the phase is computed)
+            input_fields = []
+            for distance in distances:
+                curvature = np.sqrt(squared_sum + distance**2)
+                curvature = torch.tensor(curvature, dtype=torch.float64, device=self.height_map.device)
+                curvature = curvature.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+                # For each wavelength, compute spherical phase shift (vectorized if desired)
+                phase = compl_exp((2 * np.pi / np.array(self.wave_lengths)).reshape(-1, 1, 1) * curvature)
+                # Stack into a field with channels equal to number of wavelengths.
+                # Here we assume phase has shape (num_wavelengths, 1, H, W) and add batch dim.
+                input_fields.append(phase.unsqueeze(0))
+        self.psfs = []
+        for depth_idx, input_field in enumerate(input_fields):
+            field = self.optical_element(input_field)
+            field = circular_aperture(field)
+            sensor_incident_field = propagate_fresnel(field,
+                                                      distance=self.sensor_distance,
+                                                      sampling_interval=self.input_sample_interval,
+                                                      wave_lengths=self.wave_lengths)
+            psf = get_intensities(sensor_incident_field)
+            if not self.upsample:
+                psf = area_downsampling_torch(psf, self.psf_resolution[0])
+            psf_sum = psf.sum(dim=(2, 3), keepdim=True) + 1e-12
+            psf = psf / psf_sum
+            # Optionally transpose dimensions if needed; here we keep (batch, channels, H, W)
+            self.psfs.append(psf)
+        if self.target_distance is not None:
+            self.target_psf = self.psfs.pop()
+
+    def get_sensor_img(self, input_img, noise_sigma=0.001, depth_dependent=False, depth_map=None):
+        # Upsample input image to wave resolution if required.
+        if self.upsample:
+            print("Images are upsampled to wave resolution")
+            input_img = F.interpolate(input_img, size=self.wave_resolution, mode='nearest')
+        else:
+            print("Images are not upsampled to wave resolution")
+        if depth_dependent:
+            if self.upsample and depth_map is not None:
+                depth_map = F.interpolate(depth_map, size=self.wave_resolution, mode='nearest')
+            sensor_img = depth_dep_convolution(input_img, self.psfs, disc_depth_map=depth_map)
+        else:
+            sensor_img = img_psf_conv(input_img, self.psfs[0])
+        if self.upsample:
+            sensor_img = area_downsampling_torch(sensor_img, self.sensor_resolution[0])
+        noisy_img = self.noise_model(sensor_img, noise_sigma)
+        return noisy_img
+
+class ZernikeSystem:
+    """
+    Simulates a single-lens system whose optical element is parameterized by a Zernike basis.
+    """
+    def __init__(self,
+                 zernike_volume,  # Tensor of shape (num_basis, H, W)
+                 wave_resolution,  # Tuple (H, W)
+                 wave_lengths,
+                 sensor_distance,
+                 sensor_resolution,
+                 input_sample_interval,
+                 refractive_idcs,
+                 height_tolerance,
+                 target_distance=None,
+                 upsample=True,
+                 depth_bins=None):
+        self.sensor_distance = sensor_distance
+        self.zernike_volume = zernike_volume
+        self.wave_resolution = wave_resolution
+        self.wave_lengths = wave_lengths
+        self.depth_bins = depth_bins
+        self.sensor_resolution = sensor_resolution
+        self.upsample = upsample
+        self.target_distance = target_distance
+        self.height_tolerance = height_tolerance
+        self.input_sample_interval = input_sample_interval
+        self.refractive_idcs = refractive_idcs
+        self.psf_resolution = sensor_resolution
+        self.physical_size = float(self.wave_resolution[0] * self.input_sample_interval)
+        print("Physical size is %0.2e.\nWave resolution is %d." % (self.physical_size, self.wave_resolution[0]))
+        self._build_height_map()
+        self._get_psfs()
+
+    def _build_height_map(self):
+        num_basis = self.zernike_volume.shape[0]
+        zernike_inits = np.zeros((num_basis, 1, 1), dtype=np.float32)
+        zernike_inits[3] = -51.  # Setting defocus approximately for 1m focus.
+        zernike_inits_tensor = torch.tensor(zernike_inits, dtype=torch.float32)
+        self.zernike_coeffs = nn.Parameter(zernike_inits_tensor)
+        self.height_map = torch.sum(self.zernike_coeffs * self.zernike_volume, dim=0, keepdim=True)  # (1, H, W)
+        self.height_map = self.height_map.unsqueeze(1)  # (1, 1, H, W)
+        self.element = PhasePlate(wave_lengths=self.wave_lengths,
+                                  height_map=self.height_map,
+                                  refractive_idcs=self.refractive_idcs,
+                                  height_tolerance=self.height_tolerance)
+
+    def _get_psfs(self):
+        distances = list(self.depth_bins) if self.depth_bins is not None else []
+        if self.target_distance is not None:
+            distances.append(self.target_distance)
+        N, M = self.wave_resolution
+        y, x = np.mgrid[-N//2:N//2, -M//2:M//2].astype(np.float64)
+        x = x / N * self.physical_size
+        y = y / M * self.physical_size
+        squared_sum = x**2 + y**2
+        wave_nos = 2 * np.pi / np.array(self.wave_lengths)
+        wave_nos = wave_nos.reshape(1, 1, 1, -1)
+        input_fields = []
+        for distance in distances:
+            curvature = np.sqrt(squared_sum + distance**2)
+            curvature = torch.tensor(curvature, dtype=torch.float64, device=self.zernike_volume.device)
+            curvature = curvature.unsqueeze(0).unsqueeze(-1)  # (1, H, W, 1)
+            # Compute spherical wavefront (broadcast over wavelengths)
+            wn_tensor = torch.tensor(wave_nos, dtype=torch.float64, device=self.zernike_volume.device)
+            spherical_wavefront = compl_exp(wn_tensor * curvature).to(torch.complex64)
+            input_fields.append(spherical_wavefront)
+        self.psfs = []
+        for depth_idx, input_field in enumerate(input_fields):
+            field = self.element(input_field)
+            field = circular_aperture(field)
+            sensor_incident_field = propagate_fresnel(field,
+                                                      distance=self.sensor_distance,
+                                                      sampling_interval=self.input_sample_interval,
+                                                      wave_lengths=self.wave_lengths)
+            psf = get_intensities(sensor_incident_field)
+            if not self.upsample:
+                psf = area_downsampling_torch(psf, self.psf_resolution[0])
+            psf = psf / (psf.sum(dim=(2, 3), keepdim=True) + 1e-12)
+            self.psfs.append(psf)
+        if self.target_distance is not None:
+            self.target_psf = self.psfs.pop()
+
+    def get_sensor_img(self, input_img, noise_sigma, depth_dependent=False, depth_map=None):
+        if self.upsample:
+            print("Images are upsampled to wave resolution")
+            input_img = F.interpolate(input_img, size=self.wave_resolution, mode='nearest')
+        else:
+            print("Images are not upsampled to wave resolution")
+        if depth_dependent:
+            if self.upsample and depth_map is not None:
+                depth_map = F.interpolate(depth_map, size=self.wave_resolution, mode='nearest')
+            sensor_img = depth_dep_convolution(input_img, self.psfs, disc_depth_map=depth_map)
+        else:
+            sensor_img = img_psf_conv(input_img, self.psfs[0])
+        if self.upsample:
+            sensor_img = area_downsampling_torch(sensor_img, self.sensor_resolution[0])
+        noisy_img = gaussian_noise(sensor_img, noise_sigma)
+        return noisy_img
+
