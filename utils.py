@@ -2685,3 +2685,122 @@ print("LPIPS:", lpips_value.item())
 
 
 
+
+
+
+
+
+
+======
+import torch
+import torch.nn.functional as F
+import pandas as pd
+import matplotlib.pyplot as plt
+
+def calSNR(img_tensor):
+    """
+    Example SNR metric: mean / std of the image tensor.
+    Modify if you have a different SNR definition.
+    """
+    mean_val = img_tensor.mean().item()
+    std_val = img_tensor.std().item() + 1e-8  # small epsilon to avoid div-by-zero
+    return mean_val / std_val
+
+def matched_filter(data, kernel, save_plot="matched_filter_results.png"):
+    """
+    Args:
+        data:   (m, 1, 96, 96) PyTorch float tensor
+        kernel: (9, 9) PyTorch float tensor (matched filter)
+        save_plot: filename for saving the figure
+
+    Returns:
+        convolved_data: PyTorch float tensor of shape (m, 1, 96, 96)
+        df_peaks:       Pandas DataFrame with columns [("peak_row","peak_col"), "peak_intensity", "SNR"]
+    """
+
+    m, c, h, w = data.shape
+    assert (c, h, w) == (1, 96, 96), "data must be (m,1,96,96)"
+
+    # Reshape kernel to (out_channels=1, in_channels=1, kernel_h=9, kernel_w=9)
+    # so it can be used with torch.nn.functional.conv2d
+    kernel_4d = kernel.unsqueeze(0).unsqueeze(0)  # (1,1,9,9)
+
+    # Prepare output storage
+    convolved_data = torch.zeros_like(data)  # (m,1,96,96)
+    
+    # Lists to store peak info for the DataFrame
+    peaks_info = []
+
+    for i in range(m):
+        # 1) Extract single image of shape (1,96,96)
+        single_image = data[i]  # shape (1,96,96)
+        
+        # 2) Zero-pad the image by 5 on each side => pad=(left,right,top,bottom)
+        # This results in a shape (1,106,106)
+        padded = F.pad(single_image, (5, 5, 5, 5))
+        
+        # 3) Convolve with the matched filter kernel (stride=1, no bias)
+        # conv2d expects input of shape (batch_size=1, in_channels=1, H, W)
+        padded = padded.unsqueeze(0)        # shape (1,1,106,106)
+        conv = F.conv2d(padded, kernel_4d, stride=1)  # shape (1,1,106-9+1,106-9+1)=(1,1,98,98)
+        
+        # We want final shape to be (1,96,96). Center-crop from (1,1,98,98)
+        # We'll just take the central 96x96 region
+        conv_cropped = conv[:, :, 1:-1, 1:-1]  # shape (1,1,96,96)
+        
+        # Store the result in convolved_data
+        convolved_data[i] = conv_cropped.squeeze(0)  # remove batch dim => (1,96,96)
+
+        # 5) Find peak location & intensity
+        # Flatten (1,96,96) -> (96*96), then get max
+        flat_conv = conv_cropped.view(-1)
+        peak_val, peak_idx = torch.max(flat_conv, dim=0)
+        peak_val = peak_val.item()
+        peak_row = peak_idx.item() // 96
+        peak_col = peak_idx.item() % 96
+
+        # Calculate SNR
+        snr_val = calSNR(conv_cropped)
+
+        # Store in a list
+        peaks_info.append({
+            "peak_rc": (peak_row, peak_col),
+            "peak_intensity": peak_val,
+            "SNR": snr_val
+        })
+
+    # Create DataFrame
+    df_peaks = pd.DataFrame(peaks_info)
+
+    # 6) Plot: we create an m x 3 figure
+    #    Columns: [original image, matched filter (kernel), convolved image]
+    fig, axes = plt.subplots(m, 3, figsize=(9, 3*m))
+
+    # Convert kernel to CPU numpy for plotting
+    kernel_np = kernel.detach().cpu().numpy()
+
+    for i in range(m):
+        # Original image
+        axes[i, 0].imshow(data[i,0].detach().cpu().numpy(), cmap="gray")
+        axes[i, 0].set_title(f"Original Image {i}")
+        axes[i, 0].axis("off")
+
+        # Matched filter (just show the same kernel each row)
+        axes[i, 1].imshow(kernel_np, cmap="gray")
+        axes[i, 1].set_title("Matched Filter")
+        axes[i, 1].axis("off")
+
+        # Convolved image
+        axes[i, 2].imshow(convolved_data[i,0].detach().cpu().numpy(), cmap="gray")
+        axes[i, 2].set_title(f"Convolved Image {i}")
+        axes[i, 2].axis("off")
+
+    plt.tight_layout()
+    plt.savefig(save_plot, dpi=100)
+    plt.close(fig)
+
+    # Return final results
+    return convolved_data, df_peaks
+
+
+
