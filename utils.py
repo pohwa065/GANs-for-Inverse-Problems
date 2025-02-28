@@ -2511,3 +2511,173 @@ class ZernikeSystem:
         noisy_img = gaussian_noise(sensor_img, noise_sigma)
         return noisy_img
 
+
+
+
+
+
+
+
+
+
+
+
+=======
+import os
+from google.colab import drive
+drive.mount('/content/drive')
+path = "/content/drive/My Drive/Stanford/courses/EE367_2025/diffusion/diffusion_project" # Replace with your path to the diffusion_project folder
+os.chdir(path)
+print(f"Current working directory: {os.getcwd()}")
+
+# Import required packages
+import torch
+import torchvision.transforms as transforms
+import matplotlib.pyplot as plt
+from functools import partial
+
+from guided_diffusion.unet import create_model
+from guided_diffusion.gaussian_diffusion import get_named_beta_schedule
+from util.img_utils import clear_color
+from util.logger import get_logger
+from util.img_utils import Blurkernel
+
+from PIL import Image
+import numpy as np
+from tqdm.auto import tqdm
+
+from skimage.metrics import peak_signal_noise_ratio as psnr
+from util.setup_env import setup_diffusion_environment
+
+# Initialize the diffusion environment
+setup = setup_diffusion_environment()
+
+# Extract components
+model = setup['model']
+device = setup['device']
+logger = setup['logger']
+
+num_timesteps = 1000 # Total number of noise steps
+betas = get_named_beta_schedule(schedule_name="linear", num_diffusion_timesteps=num_timesteps)
+
+alphas = 1.0 - betas
+alphas_cumprod = np.cumprod(alphas, axis=0)
+alphas_cumprod_prev = np.append(1.0, alphas_cumprod[:-1])
+
+sqrt_recip_alphas_cumprod = np.sqrt(1.0 / alphas_cumprod)
+sqrt_recipm1_alphas_cumprod = (1.0 - alphas_cumprod) / np.sqrt(alphas_cumprod)
+
+posterior_mean_coef1 = betas * np.sqrt(alphas_cumprod_prev) / (1.0-alphas_cumprod)
+posterior_mean_coef2 = (1.0 - alphas_cumprod_prev) * np.sqrt(alphas) / (1.0 - alphas_cumprod)
+
+posterior_variance = (
+    betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
+)
+posterior_log_variance_clipped = np.log(
+    np.append(posterior_variance[1], posterior_variance[1:])
+)
+
+def extract_and_expand(array, time, target):
+    """
+    Extract values from an array at specified timesteps and expand to match target shape.
+
+    Args:
+        array: Source array containing coefficient values
+        time: Timestep indices to extract
+        target: Tensor whose shape we want to match
+
+    Returns:
+        Expanded tensor matching target shape with values from array at specified times
+    """
+    array = torch.from_numpy(array).to(target.device)[time].float()
+    while array.ndim < target.ndim:
+        array = array.unsqueeze(-1)
+    return array.expand_as(target)
+
+
+def forward_process(x_0, t, alphas_cumprod=alphas_cumprod):
+    """
+    Forward diffusion process that adds noise gradually to x_0 to get x_t
+
+    Args:
+        x_0 (tensor): Initial image/data
+        t (int/tensor): Timestep(s)
+        alphas_cumprod: Precomputed constants
+
+    Returns:
+        x_t (tensor): Noisy version of x_0 at timestep t
+    """
+
+    ############### begin: complete the following code section  ###############
+
+
+    ############### end: complete the following code section  ###############
+
+    return x_t
+
+
+def denoise(x_t, t, eps):
+    """
+    Perform single-step denoising using the predicted noise.
+    i.e. x_0_hat from the DPS paper
+
+    Args:
+        x_t: Noisy image at timestep t
+        t: Current timestep
+        eps: Predicted noise from the model
+
+    Returns:
+        Denoised image prediction using the diffusion model equation
+    """
+
+    score = - eps / np.sqrt(1.0 - alphas_cumprod[t])
+
+    ############### begin: complete the following code section  ###############
+
+
+    ############### end: complete the following code section  ###############
+
+
+# Load and preprocess sample image
+transform = transforms.Compose([transforms.ToTensor(),
+                                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
+img = Image.open('data/samples/00015.png').convert('RGB') # Replace with your choice of test image
+img = transform(img)
+ref_img = img.to(device).unsqueeze(dim=0) # (B, C, H, W)
+
+# Denoise
+t = 100 # Choose timestep
+t = torch.tensor([t], device=device)  # Wrap in list to make it 1D tensor
+noisy_img = forward_process(ref_img, t)
+model_output = model(noisy_img, t)
+model_output, model_var_values = torch.split(model_output, noisy_img.shape[1], dim=1)
+denoised_img = denoise(noisy_img, t, model_output)
+
+images = [clear_color(ref_img), clear_color(noisy_img), clear_color(denoised_img)]
+titles = ["x_0", "x_t", "Denoised"]
+fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+for i, ax in enumerate(axes):
+      ax.imshow(images[i])
+      ax.set_title(titles[i])
+      ax.axis('off')
+
+plt.tight_layout()
+plt.show()
+
+
+import lpips
+ref_img_np = ref_img.squeeze(0).permute(1, 2, 0).cpu().numpy()
+sample_np = denoised_img.squeeze(0).permute(1, 2, 0).cpu().detach().numpy()
+
+# Calculate PSNR & LPIPS
+psnr_value = psnr(ref_img_np, sample_np, data_range=ref_img_np.max() - ref_img_np.min())
+loss_fn = lpips.LPIPS(net='alex').to(device)
+lpips_value = loss_fn.forward(ref_img, denoised_img)
+
+print("PSNR:", psnr_value)
+print("LPIPS:", lpips_value.item())
+
+
+
+
+
