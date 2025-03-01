@@ -1,4 +1,4 @@
-"""
+_"""
 The test code for:
 "Adversarial Training for Solving Inverse Problems"
 using Tensorflow.
@@ -2802,5 +2802,149 @@ def matched_filter(data, kernel, save_plot="matched_filter_results.png"):
     # Return final results
     return convolved_data, df_peaks
 
+
+
+import torch
+import torch.nn.functional as F
+import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+
+def create_2d_gaussian(image_size, amplitude, sigma, center=None, device='cpu'):
+    """
+    Creates a 2D Gaussian.
+    
+    Args:
+        image_size (int): The size of the (square) output image.
+        amplitude (float): Peak amplitude.
+        sigma (float): Standard deviation.
+        center (tuple or None): (row, col) of the Gaussian center. If None, use center of image.
+        device (torch.device): Device to create tensor on.
+        
+    Returns:
+        2D tensor of shape (image_size, image_size)
+    """
+    x = torch.arange(image_size, device=device, dtype=torch.float32)
+    y = torch.arange(image_size, device=device, dtype=torch.float32)
+    X, Y = torch.meshgrid(x, y, indexing='ij')
+    if center is None:
+        center = (image_size / 2, image_size / 2)
+    cx, cy = center
+    gaussian = amplitude * torch.exp(- ((X - cx)**2 + (Y - cy)**2) / (2 * sigma**2))
+    return gaussian
+
+def simulate_matched_filter_snr_2d(m=5, image_size=96, amplitude=1.0, sigma_signal=8.0,
+                                   sigma_noise=0.1, kernel_size=21, save_plot="matched_filter_2d.png"):
+    """
+    Simulates m 2D images (of shape 1x96x96) each with a Gaussian feature and additive white noise.
+    Then applies a matched filter (a 2D Gaussian kernel) and computes SNR before and after filtering.
+    
+    Returns:
+        data:       Tensor of shape (m, 1, 96, 96) with the noisy images.
+        conv_data:  Tensor of shape (m, 1, 96, 96) with the matched filter output.
+        df:         DataFrame with one row per image containing:
+                    - peak_position: (row, col) of the filtered image peak.
+                    - peak_intensity: value of that peak.
+                    - SNR: measured SNR in the filtered image.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Generate m noisy images
+    images = []
+    for i in range(m):
+        # Create the clean 2D Gaussian feature (signal)
+        clean = create_2d_gaussian(image_size, amplitude, sigma_signal, device=device)
+        # Create noise
+        noise = sigma_noise * torch.randn(image_size, image_size, device=device)
+        noisy = clean + noise
+        images.append(noisy.unsqueeze(0))  # add channel dimension
+    
+    # data has shape (m, 1, image_size, image_size)
+    data = torch.stack(images, dim=0)
+    
+    # Raw SNR: peak of clean signal divided by noise std.
+    clean_signal = create_2d_gaussian(image_size, amplitude, sigma_signal, device=device)
+    raw_SNR = clean_signal.max().item() / sigma_noise
+    
+    # Create the matched filter kernel.
+    # We assume the filter is a cropped 2D Gaussian of size kernel_size x kernel_size.
+    kernel = create_2d_gaussian(kernel_size, amplitude, sigma_signal, center=(kernel_size/2, kernel_size/2), device=device)
+    # For conv2d, reshape kernel to (out_channels=1, in_channels=1, kernel_size, kernel_size)
+    kernel_4d = kernel.unsqueeze(0).unsqueeze(0)
+    
+    # Pad each image so that convolution produces an output of the same spatial size.
+    pad_size = kernel_size // 2
+    padded_data = F.pad(data, (pad_size, pad_size, pad_size, pad_size))
+    
+    # Convolve using stride=1. The output has shape (m,1,image_size, image_size)
+    conv_data = F.conv2d(padded_data, kernel_4d, stride=1)
+    
+    # Theoretical SNR gain: in matched filtering, the amplitude SNR improves by a factor sqrt(E_k)
+    # where E_k = sum(kernel^2)
+    E_k = torch.sum(kernel**2).item()
+    theoretical_SNR = raw_SNR * np.sqrt(E_k)
+    
+    # For each filtered image, compute measured SNR.
+    # We assume the noise-dominated region is, for instance, the top 10 rows.
+    measured_SNRs = []
+    peak_positions = []
+    peak_intensities = []
+    for i in range(m):
+        conv_img = conv_data[i, 0]  # (image_size, image_size)
+        peak_val = conv_img.max().item()
+        peak_idx = torch.argmax(conv_img).item()
+        row = peak_idx // image_size
+        col = peak_idx % image_size
+        peak_positions.append((row, col))
+        peak_intensities.append(peak_val)
+        
+        noise_region = conv_img[:10, :]  # assume these rows are mostly noise
+        sigma_conv = noise_region.std().item() + 1e-8
+        measured_SNRs.append(peak_val / sigma_conv)
+    
+    measured_SNR_avg = np.mean(measured_SNRs)
+    
+    # Create a DataFrame with the peak info for each image.
+    df = pd.DataFrame({
+        "peak_position": peak_positions,
+        "peak_intensity": peak_intensities,
+        "SNR": measured_SNRs
+    })
+    
+    # Plot m rows with 3 columns: original image, matched filter kernel, convolved image.
+    fig, axes = plt.subplots(m, 3, figsize=(12, 4 * m))
+    if m == 1:
+        axes = np.expand_dims(axes, axis=0)
+    
+    kernel_np = kernel.cpu().numpy()
+    for i in range(m):
+        orig_img = data[i, 0].cpu().numpy()
+        conv_img = conv_data[i, 0].cpu().numpy()
+        
+        axes[i, 0].imshow(orig_img, cmap='gray')
+        axes[i, 0].set_title(f"Original Image {i}")
+        axes[i, 0].axis("off")
+        
+        axes[i, 1].imshow(kernel_np, cmap='gray')
+        axes[i, 1].set_title("Matched Filter Kernel")
+        axes[i, 1].axis("off")
+        
+        axes[i, 2].imshow(conv_img, cmap='gray')
+        axes[i, 2].set_title(f"Convolved Image {i}")
+        axes[i, 2].axis("off")
+    
+    plt.tight_layout()
+    plt.savefig(save_plot, dpi=150)
+    plt.close(fig)
+    
+    print(f"Raw (input) SNR: {raw_SNR:.2f}")
+    print(f"Theoretical SNR after matched filtering: {theoretical_SNR:.2f}")
+    print(f"Average measured SNR after matched filtering: {measured_SNR_avg:.2f}")
+    
+    return data, conv_data, df
+
+# Run the simulation for the 2D case:
+data_2d, conv_2d, df_results = simulate_matched_filter_snr_2d()
+print(df_results)
 
 
