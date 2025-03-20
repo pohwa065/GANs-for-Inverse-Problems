@@ -2511,3 +2511,280 @@ class ZernikeSystem:
         noisy_img = gaussian_noise(sensor_img, noise_sigma)
         return noisy_img
 
+
+
+
+
+==========sp5==========
+
+function tool = spsensfw(config,scatter, optics,elec,mech)
+% tool = spsensfw(config,scatter, optics,electronics,mech) SPMODEL wrapper for SPSENSF, handles optimization calls
+%   The function handles calls to the main sensitivity calculator SPSENSF by following steps:
+%       - call SPSENSF (if needed) to calculate RPM profile based on throughput target
+%       - call SPSENSF with 6:1 demo sensitivity target
+%       - call SPSENSF with 8:1 production senstivity target
+%       - fold results from both calls into well formatted TOOL structure
+%
+% See also: SPSENSF3, FSOLVE
+
+global OPTIMFLAG
+if isempty(OPTIMFLAG), OPTIMFLAG = 1; end;%OPTIMFLAG = 1; % 1-fsolve (default), 0-fzero
+
+global FLAG_VERBOSE
+if isempty(FLAG_VERBOSE), FLAG_VERBOSE = 1; end;
+
+%-------------------------------------------------------------------------
+% Optimize for Tput target
+if ~isequal(mech.rpmmode, 'manual')
+    inputVarName = 'mech.rpmprofile(1)';inputVar0 = 1000;
+    outputVarName = 'mech.throughput';outputVarTarget = mech.tputTarget;
+    %outputVarName = 'mech.throughput';outputVarTarget = 70;
+
+    if OPTIMFLAG
+        s1 = @(x) abs(spsensf(scatter, optics, elec, mech,outputVarName,inputVarName, x) - outputVarTarget);
+        [xx,fval,exitflag,output] = fsolve(s1, inputVar0, config.options);
+    else
+        s1 = @(x) spsensf(scatter, optics, elec, mech,outputVarName,inputVarName, x) - outputVarTarget;
+        [xx,fval,exitflag,output] = fzero(s1, inputVar0, config.options);
+    end;
+    
+        
+    [y,tool] = spsensf(scatter, optics, elec, mech,outputVarName,inputVarName, xx);
+    mech.rpmprofile = round(tool.mech.rpmprofile);
+    mech.rpmprofile(1) = min([mech.rpmprofile(1), mech.rpmMaxLimit]);
+    %    if mech.rpmprofile(1) > mech.rpmMaxLimit, mech.rpmprofile(!) = [mech.rpmMaxLimit, ];end;
+end;
+
+%-------------------------------------------------------------------------
+% Calculate PSL sensitivity for given SNR
+if ~isfield(config,'SNRfunctionName') || isempty(config.SNRfunctionName)
+    % Standard SNR target values
+    config.SNRtargetOneFalse = 6;
+    config.SNRtarget95CR = 8;
+else
+%    hfunc = str2func(config.SNRfunctionName);
+    switch lower(config.SNRfunctionName)
+        case 'speckle_statistics'
+            [config.SNRtargetOneFalse, config.SNRtarget95CR] = ...
+                speckle_statistics(scatter.haze.speckle.noise_frac0,optics.illum.spotsizeR*1e6,optics.illum.spotsizeT*1e6);
+        otherwise
+            error(['SPSENSFW: Unknown SNR Target function ' config.SNRfunctionName]);
+    end; % switch
+end; % if
+
+outputVarTarget = config.SNRtargetOneFalse; outputVarName = 'noise.snr_background';
+inputVarName = 'scatter.psl.diam'; inputVar0 = scatter.psl.diam;
+local_spsensfw();
+
+config.demo.diam = tool.scatter.psl.diam;
+config.demo.snr = tool.noise.snr_background;
+config.demo.snrMode = 'Signal-to-Background';
+config.name = [config.name ':' num2str(tool.mech.throughput,'%.1f') 'wph'];
+
+%outputVarTarget = 9; outputVarName = 'noise.snr_background';
+outputVarTarget = config.SNRtarget95CR; outputVarName = 'noise.snr_total';
+inputVarName = 'scatter.psl.diam'; inputVar0 = scatter.psl.diam;
+local_spsensfw();
+
+config.mode = 'Production';
+tool.config = config;
+
+%-------------------------------------------------------------------------
+    function local_spsensfw()
+
+        
+        if FLAG_VERBOSE
+            disp(sprintf('\n----- Begin Optimization --------------------------------------------------'));
+        end;
+        
+        s1 = @(x) spsensf(scatter, optics, elec, mech,outputVarName,inputVarName, x) - outputVarTarget;
+
+        if OPTIMFLAG
+            s1 = @(x) abs(spsensf(scatter, optics, elec, mech,outputVarName,inputVarName, x) - outputVarTarget);
+            [xx,fval,exitflag,output] = fsolve(s1, inputVar0, config.options);
+        else
+            s1 = @(x) spsensf(scatter, optics, elec, mech,outputVarName,inputVarName, x) - outputVarTarget;
+            [xx,fval,exitflag,output] = fzero(s1, inputVar0, config.options);
+        end;
+            
+            
+        if exitflag ~= 1
+            % one more attempt : reduce hazetarget
+            disp(sprintf('WARNING!! First iteration did not converge. Reducing hazeTargetADC by 8 and trying again'));
+            elec.pmt.hazeTargetADC = elec.pmt.hazeTargetADC/8;
+            inputVar0 = inputVar0 - 10; 
+            
+            if OPTIMFLAG
+                s1 = @(x) abs(spsensf(scatter, optics, elec, mech,outputVarName,inputVarName, x) - outputVarTarget);
+                [xx,fval,exitflag,output] = fsolve(s1, inputVar0, config.options);
+            else
+                s1 = @(x) spsensf(scatter, optics, elec, mech,outputVarName,inputVarName, x) - outputVarTarget;
+                [xx,fval,exitflag,output] = fzero(s1, inputVar0, config.options);
+            end;
+
+            if exitflag ~= 1
+                error('Optimization failed. Rerun with Display = iter to diagnose the problem');
+            end;
+        end;
+        %PslDiam = xx;
+
+        %[y,psl, haze, noise, mech] = spsensf(ppmtable, PslDiam, HazePPM, SpotSizeT,SpotSizeR, IncAngle, LaserPower);
+        %[y,psl, haze, noise, mech] = spsensf_1(ppmtable, PslDiam, HazePPM, SpotSizeT,SpotSizeR, IncAngle, LaserPower,outputVarName,inputVarName, xx);
+        %[y,tool] = spsensf2(ppmtable, PslDiam, HazePPM, SpotSizeT,SpotSizeR, IncAngle, LaserPower,outputVarName,inputVarName, xx);
+        [y,tool] = spsensf(scatter, optics, elec, mech,outputVarName,inputVarName, xx);
+
+        %disp(sprintf('--------------------------------------------------'));
+        %disp(sprintf('\n'));
+        if FLAG_VERBOSE
+            disp(sprintf('Configuration : %s', config.name));
+            if ischar(tool.scatter.psl.fname), disp(sprintf('PSL file : %s', tool.scatter.psl.fname));end;
+            disp(sprintf('PslDiam : %.2f  nm',tool.scatter.psl.diam));
+            disp(sprintf('Throughput : %.1f  WPH',tool.mech.throughput));
+            disp(sprintf('Spot Size : %.2f x %.2f um',tool.optics.illum.spotsizeT*1e6, tool.optics.illum.spotsizeR*1e6));
+            disp(sprintf('Number of Spots : %d',tool.optics.illum.numberspots));
+            disp(sprintf('Laser Power : %.3f W',tool.optics.illum.power0));
+            disp(sprintf('Laser Wavelength : %.0f nm',tool.optics.illum.lambda*1e9));
+            disp(sprintf('Channel : %s',tool.optics.coll.channel));
+            disp(sprintf('Haze : %.3f ppm = %.0f ADC',tool.scatter.haze.int_ppm,tool.scatter.haze.peak_ADC));
+            %disp(sprintf('Sampling Freq : %.1f  MHz',tool.mech.samplingfreq/1e6));
+            disp(sprintf('RPM : [%.0f, %.0f]',tool.mech.rpmprofile(1),tool.mech.rpmprofile(2)));
+            disp(sprintf('PMT Gain : %g',tool.elec.pmt.gain));
+            disp(sprintf('OD : %d',tool.optics.coll.od));
+            disp(sprintf('Noise limit : %s',tool.noise.maxSourceName));
+            disp(sprintf('SNR : %.2f, %s',outputVarTarget, outputVarName));
+
+            disp(sprintf('----- End Optimization ------------------------------------------------\n'));
+        end;
+    end; % local_spsensfw
+
+end
+
+function [y,tool] = spsensf(scatter, optics,electronics,mech, outputVarName, inputVarName, inputVar)
+% [y,tool] = spsensf(scatter, optics,electronics,outputVarName, inputVarName, inputVar) SPMODEL main sensitivity calculator
+%  Input
+%   scatter, optics, elec, mech : input structures. See SPINIT for more details.
+%   outputVarName : string with the name of the output variable assigned to Y. This is used by optimization calls to define the optimization goal
+%   inputVarName : string with the name of the input optimization variable
+%   inputVar : value of the variable "inputVarName"
+% Output
+%   tool : output structure
+%   Y : value of the variable "outputVarName"
+
+if ~exist('outputVarName','var')
+   outputVarName = 'noise.snr_background';
+end;
+
+if exist('inputVarName','var')
+    eval([inputVarName ' = '  num2str(inputVar,'%.15e') ';']);
+end;
+
+psl = scatter.psl;
+haze = scatter.haze;
+speckle = scatter.haze.speckle;
+ppmtable = scatter.ppmtable;
+illum = optics.illum;
+coll = optics.coll;
+pmt = electronics.pmt;
+ab = electronics.ab;
+
+
+if length(ppmtable.diam) > 1
+    psl.int_ppm = interplogppm1(ppmtable.diam, ppmtable.diamlog, ppmtable.scatter, ppmtable.scatterlog, psl.diam)*ppmtable.spotsizeT*ppmtable.spotsizeR/(illum.spotsizeT*illum.spotsizeR); % PSL scattering intensity [ppm]
+else
+    psl.int_ppm = ppmtable.scatter*ppmtable.spotsizeT*ppmtable.spotsizeR/(illum.spotsizeT*illum.spotsizeR);
+end;
+
+psl.int_ppm = psl.int_ppm*psl.PPMcoef;
+const.qe = 1.6e-19; % e- charge
+illum.photon_energy_eV = 1240 / illum.lambda *1e-9;
+
+illum.power = illum.power0*illum.eff*coll.eff_fiber/illum.numberspots; % Power at the wafer [W]
+
+% scratch.length = 0; scratch.angle = 0; % [deg]
+% scratch.lengthspot = 1/(sqrt(cos(scratch.angle*pi/180)^2/illum.spotsizeT^2 + sin(scratch.angle*pi/180)^2/illum.spotsizeR^2));
+
+mech = spsensf_tput(mech, illum.spotsizeR, illum.spotsizeT,illum.numberspots);
+
+psl.power = psl.int_ppm*1e-6*illum.power; % Peak PSL collected light [W]
+psl.energy = psl.power * mech.xtime / 2.5; % Total collected energy, one pass, wafer edge [J]
+psl.energy_eV = psl.energy / const.qe;
+psl.number_photons = psl.energy_eV / illum.photon_energy_eV;
+
+haze.power = haze.int_ppm * 1e-6 * illum.power; % Haze collected light [W]
+haze.powerWafer = haze.wafer_ppm * 1e-6 * illum.power; % Haze collected light from wafer only[W]
+switch lower(pmt.mode)
+    case 'manual'
+        [pmt, ab] = spsensf_pmt(pmt, ab, illum.photon_energy_eV, illum.power);
+    case 'od'
+        [pmt, ab,coll.od] = spsensf_pmtgain(pmt, ab, illum.photon_energy_eV, psl.power, haze.powerWafer, illum.power);
+%        [pmt, ab,coll.od] = spsensf_pmtgain(pmt, ab, illum.photon_energy_eV, psl.power, haze.power, illum.power);
+
+    otherwise
+        error('Unknown pmt.mode method');
+end;
+
+psl.peak_current_od0 = psl.power * pmt.responsivity;
+psl.peak_ADC_od0 = psl.peak_current_od0 * ab.amp2ADC;
+haze.peak_current_od0 = haze.powerWafer * pmt.responsivity;
+%haze.peak_current_od0 = haze.power * pmt.responsivity;
+haze.peak_ADC_od0 = haze.peak_current_od0 * ab.amp2ADC;
+
+%coll.od = max([0, round(log10(max([psl.peak_ADC_od0+haze.peak_ADC_od0, 1001])/2^ab.n_bit))+1]);
+
+psl.peak_current = psl.peak_current_od0*10^(-coll.od);
+psl.peak_ADC = psl.peak_current * ab.amp2ADC;
+haze.peak_current = haze.peak_current_od0*10^(-coll.od);
+haze.peak_ADC = haze.peak_current * ab.amp2ADC;
+
+%noise.bw= min([electronics.ab.bw, mech.bw])/(electronics.ab.xscanTaps/2);
+noise.bw= min([electronics.ab.bw, mech.bw])/(electronics.ab.SNRfactor^2);
+noise.psl_shot = sqrt(2*const.qe*pmt.responsivity*10^(-coll.od)*pmt.noise_excess*noise.bw*psl.power);
+noise.psl_shot_ADC = noise.psl_shot * ab.amp2ADC;
+noise.haze_shot = sqrt(2*const.qe*pmt.responsivity*10^(-coll.od)*pmt.noise_excess*noise.bw*haze.power);
+noise.haze_shot_ADC = noise.haze_shot * ab.amp2ADC;
+noise.dark = sqrt(2*const.qe*pmt.noise_excess*noise.bw*pmt.dark_current/pmt.gain);
+noise.dark_ADC = noise.dark * ab.amp2ADC;
+
+noise.electronic = ab.electronic_noise_ADC / ab.amp2ADC;
+noise.electronic_ADC = noise.electronic * ab.amp2ADC; % circular verification, should be equal to input ab.electronic_noise_ADC
+
+% scaling speckle noise percent with different wavelength and spot size
+speckle.speckle_noise_frac = speckle.noise_frac0 * sqrt(speckle.noise_spotarea / (illum.spotsizeT*illum.spotsizeR))*illum.lambda/speckle.noise_lambda;
+speckle.number_speckles = pi^2*illum.spotsizeT*illum.spotsizeR*0.68 / 4 / illum.lambda^2;
+noise.speckle = speckle.speckle_noise_frac * haze.peak_current;
+%noise.speckle = speckle.speckle_noise_frac * haze.peak_current * haze.power / haze.powerWafer;
+noise.speckle_ADC = noise.speckle * ab.amp2ADC;
+
+noise.laser = illum.noise_perc * haze.peak_current;
+noise.laser_ADC = noise.laser * ab.amp2ADC;
+
+noise.background = sqrt(noise.haze_shot^2 + noise.dark^2 + noise.electronic^2 + noise.speckle^2 + noise.laser^2);
+noise.background_ADC = noise.background * ab.amp2ADC;
+noise.total = sqrt(noise.psl_shot^2 + noise.haze_shot^2 + noise.dark^2 + noise.electronic^2 + noise.speckle^2 + noise.laser^2);
+noise.total_ADC = noise.total * ab.amp2ADC;
+
+noisestr = {'psl','haze','dark','elec','speckle','laser'};
+[foo,ind] = max([noise.psl_shot, noise.haze_shot,noise.dark,noise.electronic,noise.speckle,noise.laser]);
+noise.maxSourceName = noisestr{ind};
+noise.snr_total = psl.peak_current / noise.total;
+noise.snr_background = psl.peak_current / noise.background;
+
+tool.optics.coll = coll;
+tool.optics.illum = illum;
+tool.mech = mech;
+tool.elec.pmt = pmt;
+tool.elec.ab = ab;
+tool.scatter.psl = psl;
+tool.scatter.haze = haze;
+tool.scatter.speckle = speckle;
+tool.scatter.psl_info = scatter.ppmtable.header;
+tool.scatter.psl_rfactor = scatter.ppmtable.rfactor;
+tool.scatter.substrate = scatter.substrate;
+tool.scatter.ppmtable.diam = ppmtable.diam;
+tool.scatter.ppmtable.scatter = psl.PPMcoef*ppmtable.scatter*ppmtable.spotsizeT*ppmtable.spotsizeR/(illum.spotsizeT*illum.spotsizeR);
+tool.noise = noise;
+eval(['y = ' outputVarName ';']);
+%disp(sprintf('SPSENSF3 : y %g, diam %g nm , gain %g, od %g, psl %g ADC, haze %g ADC', y, psl.diam, pmt.gain,coll.od, psl.peak_ADC,  haze.peak_ADC));
+%y = snr.total;
+
+return
