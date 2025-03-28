@@ -1,0 +1,80 @@
+def likelihood_grad(x, y):
+    """
+    Compute the likelihood gradient when the forward operator is the identity.
+    For a Gaussian likelihood p(y|x) ~ N(x, I), we have:
+        ∇_x log p(y|x) ∝ (y - x)
+    """
+    return y - x
+
+
+import torch
+import torch.nn.functional as F
+
+def sample_dps_unconditional(model, shape, y, timesteps=1000, beta_start=0.0001, beta_end=0.02, gamma=0.1, device="cuda"):
+    """
+    Generates a sample using DPS without a high-res prior.
+    
+    Parameters:
+      model: The trained unconditional diffusion model that predicts the noise (or velocity).
+      shape: Output shape (e.g., (n, channels, H, W)).
+      y: Observation (measurement) tensor of the same shape as the target (e.g., low-res or degraded image).
+         For identity measurement, y is assumed to be the target you want to guide sampling toward.
+      timesteps: Total number of diffusion steps.
+      beta_start, beta_end: Define the noise schedule.
+      gamma: Step size for the likelihood gradient term.
+      device: Torch device.
+      
+    Returns:
+      x: Generated sample.
+    """
+    # Create beta schedule and compute cumulative product.
+    betas = torch.linspace(beta_start, beta_end, timesteps, device=device)
+    alphas = 1.0 - betas
+    alpha_bars = torch.cumprod(alphas, dim=0)
+    
+    # Start with pure Gaussian noise.
+    x = torch.randn(shape, device=device)
+    
+    # Reverse diffusion loop.
+    for t in reversed(range(timesteps)):
+        batch_size = shape[0]
+        t_tensor = torch.full((batch_size,), t, device=device, dtype=torch.long)
+        alpha_bar_t = alpha_bars[t].view(batch_size, 1, 1, 1)
+        
+        # Use the model to predict noise (or velocity).
+        predicted_noise = model(x, t_tensor)
+        beta_t = betas[t]
+        
+        # Standard DDPM-style update (for instance, using noise prediction):
+        mu = (1.0 / torch.sqrt(1.0 - beta_t)) * (
+            x - (beta_t / torch.sqrt(1.0 - alpha_bar_t)) * predicted_noise
+        )
+        
+        # Compute likelihood gradient from the measurement y.
+        grad_data = likelihood_grad(x, y)
+        
+        if t > 0:
+            noise = torch.randn_like(x)
+            sigma_t = torch.sqrt(beta_t)
+            # DPS update: add a scaled likelihood gradient.
+            x = mu + sigma_t * noise + gamma * grad_data
+        else:
+            x = mu + gamma * grad_data
+    return x
+
+
+
+
+⸻
+
+DPS Sampling Function (Without High-Resolution Prior)
+
+The following function uses a trained diffusion model (here used for velocity or noise prediction) and applies a DPS‐inspired update. Notice that no conditioning on a high-res prior is performed; instead, we use a measurement y (which could be any available observation) to compute a data consistency term.
+
+Likelihood Gradient Function
+
+If we assume that the measurement model is
+y = x + \text{noise},
+with a Gaussian likelihood, then the log‑likelihood gradient can be computed as:
+
+\nabla_x \log p(y \mid x) \propto (y - x).
