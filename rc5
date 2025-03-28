@@ -1,0 +1,206 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+#############################################
+# Helper: Time Embedding
+#############################################
+def get_timestep_embedding(timesteps, embedding_dim):
+    """
+    Generates sinusoidal embeddings for time steps.
+    timesteps: Tensor of shape (n,) containing time step indices.
+    embedding_dim: Dimension of the embedding.
+    """
+    half_dim = embedding_dim // 2
+    emb = math.log(10000) / (half_dim - 1)
+    emb = torch.exp(torch.arange(half_dim, device=timesteps.device) * -emb)
+    emb = timesteps.float().unsqueeze(1) * emb.unsqueeze(0)
+    emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
+    if embedding_dim % 2 == 1:
+        emb = F.pad(emb, (0, 1))
+    return emb
+
+#############################################
+# A Simple Residual Block with Time Conditioning
+#############################################
+class ResidualBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, time_emb_dim):
+        """
+        A basic residual block that injects a time embedding.
+        """
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.time_emb_proj = nn.Linear(time_emb_dim, out_channels)
+        self.activation = nn.ReLU(inplace=True)
+        self.res_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else None
+
+    def forward(self, x, t_emb):
+        h = self.activation(self.conv1(x))
+        t_emb_proj = self.time_emb_proj(t_emb).unsqueeze(-1).unsqueeze(-1)
+        h = h + t_emb_proj
+        h = self.conv2(h)
+        if self.res_conv is not None:
+            x = self.res_conv(x)
+        return self.activation(h + x)
+
+#############################################
+# Unconditional Denoising Model
+#############################################
+class UnconditionalDenoisingNet(nn.Module):
+    def __init__(self, in_channels=1, base_channels=64, time_emb_dim=128):
+        """
+        A simple U-Net–like model for noise prediction.
+        """
+        super().__init__()
+        self.time_emb_dim = time_emb_dim
+        self.time_proj = nn.Linear(time_emb_dim, time_emb_dim)
+        # Encoder
+        self.conv_in = nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1)
+        self.resblock1 = ResidualBlock(base_channels, base_channels, time_emb_dim)
+        self.downsample = nn.Conv2d(base_channels, base_channels * 2, kernel_size=3, stride=2, padding=1)
+        self.resblock2 = ResidualBlock(base_channels * 2, base_channels * 2, time_emb_dim)
+        # Decoder
+        self.upsample = nn.ConvTranspose2d(base_channels * 2, base_channels, kernel_size=4, stride=2, padding=1)
+        self.resblock3 = ResidualBlock(base_channels, base_channels, time_emb_dim)
+        self.conv_out = nn.Conv2d(base_channels, in_channels, kernel_size=3, padding=1)
+
+    def forward(self, x, t):
+        t_emb = get_timestep_embedding(t, self.time_emb_dim)
+        t_emb = self.time_proj(t_emb)
+        h = self.conv_in(x)
+        h = self.resblock1(h, t_emb)
+        h = self.downsample(h)
+        h = self.resblock2(h, t_emb)
+        h = self.upsample(h)
+        h = self.resblock3(h, t_emb)
+        out = self.conv_out(h)
+        return out  # Predicted noise
+
+#############################################
+# Training Loop (Unconditional DDPM Training)
+#############################################
+def train_unconditional(model, dataloader, timesteps=1000, beta_start=0.0001,
+                        beta_end=0.02, epochs=10, device="cuda"):
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    # Create beta schedule.
+    betas = torch.linspace(beta_start, beta_end, timesteps, device=device)
+    alphas = 1.0 - betas
+    alpha_bars = torch.cumprod(alphas, dim=0)
+    
+    model.train()
+    for epoch in range(epochs):
+        for x0 in dataloader:
+            x0 = x0.to(device)
+            batch_size = x0.size(0)
+            # Sample a random time step t for each image.
+            t = torch.randint(0, timesteps, (batch_size,), device=device).long()
+            alpha_bar_t = alpha_bars[t].view(batch_size, 1, 1, 1)
+            # Sample Gaussian noise.
+            noise = torch.randn_like(x0)
+            # Forward process: generate x_t.
+            x_t = torch.sqrt(alpha_bar_t) * x0 + torch.sqrt(1 - alpha_bar_t) * noise
+            # Predict noise from the model.
+            predicted_noise = model(x_t, t)
+            loss = F.mse_loss(predicted_noise, noise)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+        print(f"Epoch {epoch+1}/{epochs} - Loss: {loss.item():.4f}")
+
+#############################################
+# Likelihood Gradient for DPS (Unconditional)
+#############################################
+def likelihood_grad(x, y):
+    """
+    For an identity measurement model with Gaussian noise,
+    the gradient of the log-likelihood is proportional to (y - x).
+    """
+    return y - x
+
+#############################################
+# Inference Loop: DPS Sampling without High-Res Prior
+#############################################
+def sample_dps_unconditional(model, shape, y, timesteps=1000, beta_start=0.0001,
+                             beta_end=0.02, gamma=0.1, device="cuda"):
+    """
+    Generates a sample using DPS when no high-res prior is available.
+    
+    Parameters:
+      model: The trained unconditional diffusion model.
+      shape: Output shape (e.g., (n, 1, H, W)).
+      y: The measurement tensor (e.g., a degraded image) to enforce data consistency.
+      gamma: DPS step size for the likelihood gradient.
+    """
+    model.eval()
+    with torch.no_grad():
+        betas = torch.linspace(beta_start, beta_end, timesteps, device=device)
+        alphas = 1.0 - betas
+        alpha_bars = torch.cumprod(alphas, dim=0)
+        # Start with pure Gaussian noise.
+        x = torch.randn(shape, device=device)
+        for t in reversed(range(timesteps)):
+            batch_size = shape[0]
+            t_tensor = torch.full((batch_size,), t, device=device, dtype=torch.long)
+            alpha_bar_t = alpha_bars[t].view(batch_size, 1, 1, 1)
+            predicted_noise = model(x, t_tensor)
+            beta_t = betas[t]
+            # Standard DDPM reverse update:
+            mu = (1.0 / torch.sqrt(1.0 - beta_t)) * (
+                x - (beta_t / torch.sqrt(1.0 - alpha_bar_t)) * predicted_noise
+            )
+            # Compute likelihood gradient (for a Gaussian likelihood with identity forward operator).
+            grad_data = likelihood_grad(x, y)
+            if t > 0:
+                noise = torch.randn_like(x)
+                sigma_t = torch.sqrt(beta_t)
+                x = mu + sigma_t * noise + gamma * grad_data
+            else:
+                x = mu + gamma * grad_data
+        return x
+
+#############################################
+# Example Usage
+#############################################
+if __name__ == "__main__":
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Instantiate the unconditional denoising model.
+    model = UnconditionalDenoisingNet(in_channels=1, base_channels=64, time_emb_dim=128)
+    model.to(device)
+    
+    # Dummy dataloader: for illustration, a list with one batch.
+    # Each sample is a clean image (e.g., 32x32, 1 channel).
+    dummy_x0 = torch.randn(8, 1, 32, 32)
+    dataloader = [dummy_x0]  # In practice, use a DataLoader yielding batches of clean images.
+    
+    # Train the model.
+    train_unconditional(model, dataloader, timesteps=1000, beta_start=0.0001,
+                        beta_end=0.02, epochs=5, device=device)
+    
+    # At inference, assume we have a measurement y (for example, a degraded image).
+    # Here, we simply use dummy_x0 as the measurement for illustration.
+    measurement = dummy_x0.to(device)
+    sample_shape = (8, 1, 32, 32)
+    generated = sample_dps_unconditional(model, sample_shape, measurement,
+                                         timesteps=1000, beta_start=0.0001, beta_end=0.02,
+                                         gamma=0.1, device=device)
+    print("Generated sample shape:", generated.shape)
+
+
+
+⸻
+
+Explanation
+	1.	Model:
+The UnconditionalDenoisingNet is a simple U‑Net–like architecture that receives a noisy image x_t and a time step t (encoded via a sinusoidal time embedding) and predicts the added noise. This is the standard target for DDPM training.
+	2.	Training Loop:
+For each clean image x_0 from the dataloader, we sample a random time step t and add Gaussian noise according to the diffusion schedule. The model is trained to predict this noise using an MSE loss.
+	3.	Inference Loop (DPS):
+During sampling, we start from pure Gaussian noise and iterate backward using the DDPM reverse update. In addition, we compute a likelihood gradient (here simply y-x for an identity forward operator with Gaussian noise) and add a scaled version (\gamma \times \text{gradient}) to the update. This “DPS” term nudges the sample toward the measurement y.
+
+This complete solution shows how to train an unconditional diffusion model and use DPS during inference when no high-resolution prior is available.
+
+complete example in PyTorch for an unconditional diffusion model that we train in the standard DDPM (noise‐prediction) manner and then use DPS (Diffusion Posterior Sampling) at inference time to “nudge” the generated sample toward a given measurement y (for example, a degraded image that you want to invert). In this version we do not have a high‑resolution prior for conditioning.
+
+
