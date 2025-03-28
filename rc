@@ -1,0 +1,332 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+###############################
+# Helper: Time Embedding
+###############################
+def get_timestep_embedding(timesteps, embedding_dim):
+    """
+    Generate sinusoidal embeddings for time steps.
+    timesteps: Tensor of shape (n,) containing integer time steps.
+    embedding_dim: Dimension of the embedding vector.
+    """
+    half_dim = embedding_dim // 2
+    emb = math.log(10000) / (half_dim - 1)
+    emb = torch.exp(torch.arange(half_dim, device=timesteps.device) * -emb)
+    emb = timesteps.float().unsqueeze(1) * emb.unsqueeze(0)
+    emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
+    if embedding_dim % 2 == 1:
+        emb = F.pad(emb, (0, 1))
+    return emb
+
+###############################
+# Attention Blocks
+###############################
+class ChannelAttention(nn.Module):
+    def __init__(self, in_channels, reduction=16):
+        """
+        Standard channel attention via global pooling.
+        """
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(in_channels, in_channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(in_channels // reduction, in_channels, bias=False),
+            nn.Sigmoid()
+        )
+        
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y
+
+class CrossChannelAttention(nn.Module):
+    def __init__(self, in_channels, reduction=16):
+        """
+        Cross-channel attention uses conditioning features to reweight the main features.
+        """
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(in_channels, in_channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(in_channels // reduction, in_channels, bias=False),
+            nn.Sigmoid()
+        )
+        
+    def forward(self, x, cond):
+        # cond: conditioning feature map from the prior branch (assumed same channel dim as x)
+        b, c, _, _ = cond.size()
+        cond_pool = F.adaptive_avg_pool2d(cond, 1).view(b, c)
+        attn = self.fc(cond_pool).view(b, c, 1, 1)
+        return x * attn
+
+###############################
+# Residual Block with Cross–Channel Attention
+###############################
+class ResidualBlockWithCrossAttention(nn.Module):
+    def __init__(self, in_channels, out_channels, time_emb_dim, reduction=16):
+        """
+        Residual block that:
+          1. Processes features with two 3×3 convolutions.
+          2. Injects a time embedding.
+          3. Applies standard channel attention.
+          4. Applies cross–channel attention with conditioning features.
+          5. Uses a skip connection (with 1×1 conv if needed).
+        """
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.time_emb_proj = nn.Linear(time_emb_dim, out_channels)
+        self.activation = nn.ReLU(inplace=True)
+        self.skip_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else None
+        self.channel_attention = ChannelAttention(out_channels, reduction=reduction)
+        self.cross_attention = CrossChannelAttention(out_channels, reduction=reduction)
+    
+    def forward(self, x, t_emb, cond=None):
+        h = self.activation(self.conv1(x))
+        # Inject time embedding.
+        t_emb_proj = self.time_emb_proj(t_emb).unsqueeze(-1).unsqueeze(-1)
+        h = h + t_emb_proj
+        h = self.conv2(h)
+        # Apply standard channel attention.
+        h = self.channel_attention(h)
+        # If conditioning is provided, apply cross-channel attention.
+        if cond is not None:
+            h = self.cross_attention(h, cond)
+        if self.skip_conv is not None:
+            x = self.skip_conv(x)
+        return self.activation(h + x)
+
+###############################
+# Prior Encoder
+###############################
+class HighResPriorEncoder(nn.Module):
+    def __init__(self, in_channels=3, feature_channels=16):
+        """
+        A simple encoder that downsamples a high–resolution prior image to produce conditioning features.
+        """
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Conv2d(in_channels, feature_channels, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(feature_channels, feature_channels, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(inplace=True)
+        )
+    
+    def forward(self, x):
+        return self.encoder(x)
+
+###############################
+# Main Model: Rectified Flow with Cross–Channel Attention and Prior Conditioning
+###############################
+class V_Prediction_CrossAttn_Model(nn.Module):
+    def __init__(self, in_channels=1, base_channels=64, time_emb_dim=128,
+                 prior_in_channels=3, prior_feature_channels=16, reduction=16):
+        """
+        U–Net for velocity (v) prediction (rectified flow) that incorporates:
+          • Time embedding.
+          • Residual blocks with both channel and cross–channel attention.
+          • Conditioning via a high–resolution prior processed by a prior encoder.
+        """
+        super().__init__()
+        self.time_emb_dim = time_emb_dim
+        self.time_proj = nn.Linear(time_emb_dim, time_emb_dim)
+        
+        # Prior encoder.
+        self.prior_encoder = HighResPriorEncoder(prior_in_channels, prior_feature_channels)
+        # Upsample prior features to match spatial resolution of x (assumed to be low-res).
+        self.prior_upsample = nn.Sequential(
+            nn.ConvTranspose2d(prior_feature_channels, prior_feature_channels, kernel_size=4, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(prior_feature_channels, prior_feature_channels, kernel_size=4, stride=2, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        
+        # U–Net encoder.
+        # We concatenate the input x with upsampled prior features along the channel dimension.
+        self.conv_in = nn.Conv2d(in_channels + prior_feature_channels, base_channels, kernel_size=3, padding=1)
+        self.resblock1 = ResidualBlockWithCrossAttention(base_channels, base_channels, time_emb_dim, reduction)
+        self.downsample = nn.Conv2d(base_channels, base_channels * 2, kernel_size=3, stride=2, padding=1)
+        self.resblock2 = ResidualBlockWithCrossAttention(base_channels * 2, base_channels * 2, time_emb_dim, reduction)
+        self.resblock3 = ResidualBlockWithCrossAttention(base_channels * 2, base_channels * 2, time_emb_dim, reduction)
+        
+        # U–Net decoder.
+        self.upsample = nn.ConvTranspose2d(base_channels * 2, base_channels, kernel_size=4, stride=2, padding=1)
+        self.resblock4 = ResidualBlockWithCrossAttention(base_channels, base_channels, time_emb_dim, reduction)
+        self.conv_out = nn.Conv2d(base_channels, in_channels, kernel_size=3, padding=1)
+    
+    def forward(self, x, t, high_res_prior):
+        """
+        x: Noisy low–resolution image, shape (n, in_channels, H, W)
+        t: Time step tensor, shape (n,)
+        high_res_prior: High–resolution prior image, shape (n, prior_in_channels, H_hr, W_hr)
+        """
+        # Compute and project time embedding.
+        t_emb = get_timestep_embedding(t, self.time_emb_dim)
+        t_emb = self.time_proj(t_emb)
+        
+        # Process high-res prior.
+        prior_features = self.prior_encoder(high_res_prior)
+        prior_features = self.prior_upsample(prior_features)  # now assumed to be (n, prior_feature_channels, H, W)
+        
+        # Concatenate the noisy image and prior features.
+        x_in = torch.cat([x, prior_features], dim=1)
+        
+        # Encoder.
+        h = self.conv_in(x_in)
+        # Here we pass prior features (as cond) to the residual block for cross attention.
+        h = self.resblock1(h, t_emb, cond=prior_features)
+        h = self.downsample(h)
+        h = self.resblock2(h, t_emb, cond=prior_features)
+        h = self.resblock3(h, t_emb, cond=prior_features)
+        
+        # Decoder.
+        h = self.upsample(h)
+        h = self.resblock4(h, t_emb, cond=prior_features)
+        out = self.conv_out(h)
+        return out  # This is v_pred (predicted velocity)
+
+###############################
+# Training Pipeline (Rectified Flow + Prior Consistency)
+###############################
+def train_rectified_flow_conditional(model, dataloader, timesteps=1000,
+                                     beta_start=0.0001, beta_end=0.02,
+                                     epochs=100, lambda_prior=0.1, device="cuda"):
+    """
+    Trains the rectified flow model with a dual loss:
+      • Velocity prediction loss (MSE between predicted and true velocity).
+      • Prior consistency loss (L2 distance between estimated x0 and downsampled prior).
+      
+    dataloader: yields (x0, high_res_prior) where
+        x0: clean target image (low–resolution), shape (n, in_channels, H, W)
+        high_res_prior: high–resolution prior image, shape (n, prior_in_channels, H_hr, W_hr)
+    """
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    # Diffusion schedule.
+    betas = torch.linspace(beta_start, beta_end, timesteps, device=device)
+    alphas = 1.0 - betas
+    alpha_bars = torch.cumprod(alphas, dim=0)
+    
+    model.train()
+    for epoch in range(epochs):
+        for x0, high_res_prior in dataloader:
+            x0 = x0.to(device)
+            high_res_prior = high_res_prior.to(device)
+            batch_size = x0.size(0)
+            optimizer.zero_grad()
+            # Sample random timestep t.
+            t = torch.randint(0, timesteps, (batch_size,), device=device).long()
+            alpha_bar_t = alpha_bars[t].view(batch_size, 1, 1, 1)
+            # Sample Gaussian noise.
+            noise = torch.randn_like(x0)
+            # Forward diffusion: x_t = sqrt(alpha_bar_t)*x0 + sqrt(1 - alpha_bar_t)*noise
+            x_t = torch.sqrt(alpha_bar_t) * x0 + torch.sqrt(1 - alpha_bar_t) * noise
+            # Compute ground truth velocity.
+            v_true = torch.sqrt(alpha_bar_t) * noise - torch.sqrt(1 - alpha_bar_t) * x0
+            # Predict velocity using our model.
+            v_pred = model(x_t, t, high_res_prior)
+            v_loss = F.mse_loss(v_pred, v_true)
+            # Invert prediction to get an estimate of x0.
+            x0_pred = torch.sqrt(alpha_bar_t) * x_t - torch.sqrt(1 - alpha_bar_t) * v_pred
+            # Downsample high-res prior to the same resolution as x0 (if needed).
+            prior_down = F.interpolate(high_res_prior, size=x0.shape[-2:], mode='bilinear', align_corners=False)
+            prior_loss = F.mse_loss(x0_pred, prior_down)
+            loss = v_loss + lambda_prior * prior_loss
+            loss.backward()
+            optimizer.step()
+        print(f"Epoch {epoch+1}/{epochs} - Loss: {loss.item():.4f}")
+
+###############################
+# Inference Pipeline (Sampling)
+###############################
+def sample_rectified_flow(model, shape, high_res_prior, timesteps=1000,
+                          beta_start=0.0001, beta_end=0.02, device="cuda"):
+    """
+    Generates a sample using the reverse diffusion (rectified flow) process.
+    
+    shape: Output shape, e.g. (n, in_channels, H, W)
+    high_res_prior: High-resolution prior image.
+    """
+    model.eval()
+    with torch.no_grad():
+        high_res_prior = high_res_prior.to(device)
+        betas = torch.linspace(beta_start, beta_end, timesteps, device=device)
+        alphas = 1.0 - betas
+        alpha_bars = torch.cumprod(alphas, dim=0)
+        # Start from pure Gaussian noise.
+        x_t = torch.randn(shape, device=device)
+        for t in reversed(range(1, timesteps)):
+            batch_size = shape[0]
+            t_tensor = torch.full((batch_size,), t, device=device, dtype=torch.long)
+            alpha_bar_t = alpha_bars[t].view(batch_size, 1, 1, 1)
+            # Predict velocity.
+            v_pred = model(x_t, t_tensor, high_res_prior)
+            # Invert to estimate x0.
+            x0_pred = torch.sqrt(alpha_bar_t) * x_t - torch.sqrt(1 - alpha_bar_t) * v_pred
+            alpha_bar_prev = alpha_bars[t-1].view(batch_size, 1, 1, 1)
+            # Deterministic DDIM update step.
+            x_t = (torch.sqrt(alpha_bar_prev) * x0_pred +
+                   torch.sqrt((1 - alpha_bar_prev) / (1 - alpha_bar_t)) *
+                   (x_t - torch.sqrt(alpha_bar_t) * x0_pred))
+        # At t=0, compute final x0.
+        t_tensor = torch.zeros(shape[0], device=device, dtype=torch.long)
+        alpha_bar_0 = alpha_bars[0].view(shape[0], 1, 1, 1)
+        v_pred = model(x_t, t_tensor, high_res_prior)
+        x0_pred = torch.sqrt(alpha_bar_0) * x_t - torch.sqrt(1 - alpha_bar_0) * v_pred
+    return x0_pred
+
+###############################
+# Example Usage
+###############################
+if __name__ == "__main__":
+    # Assume we work on GPU if available.
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Instantiate the model.
+    model = V_Prediction_CrossAttn_Model(in_channels=1, base_channels=64,
+                                         time_emb_dim=128, prior_in_channels=3,
+                                         prior_feature_channels=16, reduction=16)
+    model.to(device)
+    
+    # Dummy dataloader: yields (x0, high_res_prior).
+    # x0: low-res clean image (e.g., 32×32, 1 channel)
+    # high_res_prior: high-res conditioning image (e.g., 128×128, 3 channels)
+    dummy_x0 = torch.randn(8, 1, 32, 32)
+    dummy_prior = torch.randn(8, 3, 128, 128)
+    dataloader = [(dummy_x0, dummy_prior)]  # For illustration
+    
+    # Train for a few epochs.
+    train_rectified_flow_conditional(model, dataloader, timesteps=1000,
+                                     beta_start=0.0001, beta_end=0.02,
+                                     epochs=5, lambda_prior=0.1, device=device)
+    
+    # Inference: generate a sample conditioned on a dummy prior.
+    sample_shape = (8, 1, 32, 32)
+    generated = sample_rectified_flow(model, sample_shape, dummy_prior, timesteps=1000,
+                                      beta_start=0.0001, beta_end=0.02, device=device)
+    print("Generated sample shape:", generated.shape)
+
+
+
+
+⸻
+
+Explanation
+	1.	Model Architecture:
+– The U–Net uses residual blocks augmented with both a standard channel attention (to reweight intra–feature responses) and a cross–channel attention block (to use conditioning features from the high–resolution prior).
+– A separate prior encoder processes the high–resolution prior and then upsamples its features so they can be concatenated with the noisy image.
+– A sinusoidal time embedding is injected into each block.
+	2.	Training Pipeline:
+– For each batch, a random diffusion timestep is sampled, and the noisy image x_t is computed.
+– The network predicts the velocity v, and the rectified flow loss is computed as the MSE between v_{\text{pred}} and v_{\text{true}}.
+– An additional L₂ loss (prior consistency loss) is computed between the estimated x_0 (inverted from the predicted velocity) and a downsampled version of the high–resolution prior.
+– Both losses are combined (with a balancing weight) for backpropagation.
+	3.	Inference Pipeline:
+– Starting from pure noise, the reverse (sampling) loop iteratively updates the image using the DDIM–style update adapted for rectified flow.
+– At each step, the conditioned model predicts v and the estimated x_0 is used to update the latent.
+
+This complete pipeline demonstrates how to co–optimize a rectified flow denoising model with cross–channel attention and a prior consistency loss—all the “tricks” we discussed—to guide the reverse diffusion process with high–resolution prior information.
