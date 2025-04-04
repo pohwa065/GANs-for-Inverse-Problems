@@ -1,0 +1,96 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import gaussian_kde
+
+def save_pdf_cdf(x_grid, pdf_values, cdf_values, filename='pdf_cdf_data.npz'):
+    """
+    Save the x_grid, estimated PDF, and CDF to a file.
+    
+    Parameters:
+        x_grid (np.ndarray): The grid of x values.
+        pdf_values (np.ndarray): Estimated PDF values corresponding to x_grid.
+        cdf_values (np.ndarray): Estimated CDF values corresponding to x_grid.
+        filename (str): The filename to save the data.
+    """
+    np.savez(filename, x_grid=x_grid, pdf=pdf_values, cdf=cdf_values)
+    print(f"PDF and CDF saved to {filename}")
+
+def load_pdf_cdf(filename='pdf_cdf_data.npz'):
+    """
+    Load the x_grid, PDF, and CDF from a file.
+    
+    Parameters:
+        filename (str): The filename from which to load the data.
+    
+    Returns:
+        tuple: (x_grid, pdf_values, cdf_values)
+    """
+    data = np.load(filename)
+    return data['x_grid'], data['pdf'], data['cdf']
+
+def sample_from_saved_cdf(n_samples, filename='pdf_cdf_data.npz'):
+    """
+    Sample new values from the saved PDF/CDF using inverse transform sampling.
+    
+    Parameters:
+        n_samples (int): Number of samples to generate.
+        filename (str): The filename from which the PDF/CDF data is loaded.
+    
+    Returns:
+        np.ndarray: Array of samples drawn according to the saved distribution.
+    """
+    x_grid, _, cdf = load_pdf_cdf(filename)
+    # Generate uniform samples between 0 and 1
+    uniform_samples = np.random.uniform(0, 1, n_samples)
+    # Inverse transform: interpolate the x value corresponding to each CDF value.
+    samples = np.interp(uniform_samples, cdf, x_grid)
+    return samples
+
+# -----------------------------------------------
+# Example usage:
+# Assume we have already computed samples for X = A + B + C
+# where A ~ Gaussian, B ~ Poisson, C ~ Gamma.
+# We then estimated the PDF using KDE and computed an empirical CDF.
+
+# For demonstration, we reuse our earlier simulation code.
+# Define parameters for each distribution:
+mu_A, sigma_A = 0, 1          # Gaussian A
+lambda_B = 3                # Poisson B
+shape_C, scale_C = 2, 2       # Gamma C
+
+# Number of samples for simulation
+N = 1000000
+
+# Generate independent samples:
+samples_A = np.random.normal(mu_A, sigma_A, N)
+samples_B = np.random.poisson(lambda_B, N)
+samples_C = np.random.gamma(shape_C, scale_C, N)
+samples = samples_A + samples_B + samples_C
+
+# Estimate the PDF using a Gaussian KDE:
+kde = gaussian_kde(samples)
+x_grid = np.linspace(np.min(samples), np.max(samples), 1000)
+pdf_values = kde(x_grid)
+
+# Compute the empirical CDF:
+sorted_samples = np.sort(samples)
+cdf_values = np.array([np.searchsorted(sorted_samples, x, side='right') / len(sorted_samples) 
+                        for x in x_grid])
+
+# Save the estimated PDF and CDF for future sampling:
+save_pdf_cdf(x_grid, pdf_values, cdf_values, filename='pdf_cdf_data.npz')
+
+# Later (or in another script), sample new values from the saved PDF/CDF:
+n_new_samples = 10000
+samples_new = sample_from_saved_cdf(n_new_samples, filename='pdf_cdf_data.npz')
+
+# Verify the new samples by comparing their histogram with the saved PDF:
+print("New samples: mean = {:.3f}, std = {:.3f}".format(np.mean(samples_new), np.std(samples_new)))
+
+plt.hist(samples_new, bins=50, density=True, alpha=0.6, label='Sampled Histogram')
+plt.plot(x_grid, pdf_values, label='Saved PDF', color='red')
+plt.xlabel('x')
+plt.ylabel('Density')
+plt.title('Histogram of New Samples vs. Saved PDF')
+plt.legend()
+plt.show()
