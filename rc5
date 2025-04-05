@@ -203,4 +203,280 @@ This complete solution shows how to train an unconditional diffusion model and u
 
 complete example in PyTorch for an unconditional diffusion model that we train in the standard DDPM (noise‐prediction) manner and then use DPS (Diffusion Posterior Sampling) at inference time to “nudge” the generated sample toward a given measurement y (for example, a degraded image that you want to invert). In this version we do not have a high‑resolution prior for conditioning.
 
+====
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
 
+#############################################
+# Helper: Time Embedding
+#############################################
+def get_timestep_embedding(timesteps, embedding_dim):
+    """
+    Generates sinusoidal embeddings for time steps.
+    (Although for one-step denoising we fix t = 1, this function is kept for compatibility.)
+    
+    Args:
+        timesteps: Tensor of shape (n,) containing time step indices.
+        embedding_dim: Dimension of the embedding vector.
+        
+    Returns:
+        Tensor of shape (n, embedding_dim).
+    """
+    half_dim = embedding_dim // 2
+    emb = math.log(10000) / (half_dim - 1)
+    emb = torch.exp(torch.arange(half_dim, device=timesteps.device) * -emb)
+    emb = timesteps.float().unsqueeze(1) * emb.unsqueeze(0)
+    emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
+    if embedding_dim % 2 == 1:
+        emb = F.pad(emb, (0, 1))
+    return emb
+
+#############################################
+# A Simple Residual Block with Time Conditioning
+#############################################
+class ResidualBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, time_emb_dim):
+        """
+        A basic residual block that injects a time embedding.
+        """
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.time_emb_proj = nn.Linear(time_emb_dim, out_channels)
+        self.activation = nn.ReLU(inplace=True)
+        self.res_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else None
+
+    def forward(self, x, t_emb):
+        h = self.activation(self.conv1(x))
+        t_emb_proj = self.time_emb_proj(t_emb).unsqueeze(-1).unsqueeze(-1)
+        h = h + t_emb_proj
+        h = self.conv2(h)
+        if self.res_conv is not None:
+            x = self.res_conv(x)
+        return self.activation(h + x)
+
+#############################################
+# Unconditional Denoising Model (One-Step)
+#############################################
+class UnconditionalDenoisingNet(nn.Module):
+    def __init__(self, in_channels=1, base_channels=64, time_emb_dim=128):
+        """
+        A simple U-Net–like model for one-step noise prediction.
+        It receives a noisy image and a time step (fixed to 1) and predicts the added noise.
+        """
+        super().__init__()
+        self.time_emb_dim = time_emb_dim
+        self.time_proj = nn.Linear(time_emb_dim, time_emb_dim)
+        # Encoder
+        self.conv_in = nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1)
+        self.resblock1 = ResidualBlock(base_channels, base_channels, time_emb_dim)
+        # (For one-step, we use a shallow network.)
+        self.conv_out = nn.Conv2d(base_channels, in_channels, kernel_size=3, padding=1)
+
+    def forward(self, x, t):
+        t_emb = get_timestep_embedding(t, self.time_emb_dim)
+        t_emb = self.time_proj(t_emb)
+        h = self.conv_in(x)
+        h = self.resblock1(h, t_emb)
+        out = self.conv_out(h)
+        return out  # Predicted noise
+
+#############################################
+# Training Pipeline: Unconditional One-Step Denoising with Heterogeneous Noise
+#############################################
+def train_unconditional(model, dataloader, epochs=10, image_size=32,
+                        alpha_bar=0.9, mu_range=(-0.1, 0.1), sigma_range=(0.05, 0.2),
+                        lambda_col=1.0, device="cuda"):
+    """
+    Train the unconditional one-step denoiser.
+    
+    For each clean image x₀ (shape: [batch, 1, image_size, image_size]), 
+    the forward process is defined as:
+         x₁ = sqrt(alpha_bar)*x₀ + sqrt(1-alpha_bar)*noise,
+    where noise is generated heterogeneously per column:
+         For each image and each column, sample a mean and sigma from the given ranges;
+         then for every pixel in that column, noise ~ N(μ, σ²).
+         
+    Losses:
+      - MSE loss between predicted noise and the true noise.
+      - Column consistency loss: The predicted noise should be nearly constant along rows for each column.
+    """
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    model.train()
+    sqrt_alpha_bar = math.sqrt(alpha_bar)
+    sqrt_one_minus_alpha_bar = math.sqrt(1 - alpha_bar)
+    
+    for epoch in range(epochs):
+        for x0 in dataloader:
+            # x₀: (batch, 1, image_size, image_size)
+            x0 = x0.to(device)
+            batch_size, _, H, W = x0.shape
+            optimizer.zero_grad()
+            
+            # Fixed t = 1.
+            t = torch.ones(batch_size, device=device, dtype=torch.long)
+            
+            # Generate heterogeneous noise column-wise:
+            # For each image and for each column, sample μ and σ; same for all rows in that column.
+            mu = torch.rand(batch_size, 1, 1, W, device=device) * (mu_range[1] - mu_range[0]) + mu_range[0]
+            sigma = torch.rand(batch_size, 1, 1, W, device=device) * (sigma_range[1] - sigma_range[0]) + sigma_range[0]
+            noise = mu + sigma * torch.randn(batch_size, 1, H, W, device=device)
+            
+            # Forward process: x₁ = sqrt(alpha_bar)*x₀ + sqrt(1-alpha_bar)*noise.
+            x1 = sqrt_alpha_bar * x0 + sqrt_one_minus_alpha_bar * noise
+            
+            # Predict noise.
+            predicted_noise = model(x1, t)
+            
+            # Standard MSE loss.
+            loss_mse = F.mse_loss(predicted_noise, noise)
+            # Column consistency loss: predicted noise should be nearly constant along rows.
+            pred_col_mean = predicted_noise.mean(dim=2, keepdim=True)
+            loss_col = F.mse_loss(predicted_noise, pred_col_mean)
+            
+            loss = loss_mse + lambda_col * loss_col
+            loss.backward()
+            optimizer.step()
+        print(f"Epoch {epoch+1}/{epochs} - Loss: {loss.item():.6f}")
+
+#############################################
+# Inference Pipeline: Unconditional Denoising (DPS Variant)
+#############################################
+def denoise_one_step(model, x1, alpha_bar=0.9, device="cuda"):
+    """
+    Given a noisy image x₁, predict the noise and return the denoised image.
+    
+    Inversion: x₀_pred = sqrt(alpha_bar)*x₁ - sqrt(1-alpha_bar)*predicted_noise.
+    """
+    model.eval()
+    with torch.no_grad():
+        batch_size = x1.size(0)
+        t = torch.ones(batch_size, device=device, dtype=torch.long)
+        predicted_noise = model(x1, t)
+        sqrt_alpha_bar = math.sqrt(alpha_bar)
+        sqrt_one_minus_alpha_bar = math.sqrt(1 - alpha_bar)
+        x0_pred = sqrt_alpha_bar * x1 - sqrt_one_minus_alpha_bar * predicted_noise
+    return x0_pred
+
+#############################################
+# Likelihood Gradient for DPS (Unconditional)
+#############################################
+def likelihood_grad(x, y):
+    """
+    For an identity measurement model with Gaussian noise,
+    the gradient of the log-likelihood is proportional to (y - x).
+    """
+    return y - x
+
+#############################################
+# Inference Pipeline: DPS Sampling without Prior
+#############################################
+def sample_dps_unconditional(model, shape, y, timesteps=1000,
+                             beta_start=0.0001, beta_end=0.02, gamma=0.1, device="cuda"):
+    """
+    Generates a sample using DPS when no high-res prior is available.
+    
+    Args:
+        model: The trained unconditional denoising model.
+        shape: Output shape (n, 1, H, W).
+        y: The measurement tensor (e.g., a degraded image) used for data consistency.
+        gamma: DPS step size.
+        device: Device for computation.
+    
+    Returns:
+        Generated sample (n, 1, H, W).
+    """
+    model.eval()
+    with torch.no_grad():
+        # For one-step denoising, we use a fixed ᾱ.
+        alpha_bar = 0.9
+        sqrt_alpha_bar = math.sqrt(alpha_bar)
+        sqrt_one_minus_alpha_bar = math.sqrt(1 - alpha_bar)
+        # Start from pure noise.
+        x = torch.randn(shape, device=device)
+        # Single reverse update.
+        t_tensor = torch.ones(shape[0], device=device, dtype=torch.long)
+        predicted_noise = model(x, t_tensor)
+        mu = (1.0 / sqrt_alpha_bar) * (x - sqrt_one_minus_alpha_bar * predicted_noise)
+        # Likelihood gradient: here using an L2 loss derivative (y - x)
+        grad_data = likelihood_grad(x, y)
+        x_final = mu + gamma * grad_data
+        return x_final
+
+#############################################
+# Iterative Refinement Function (Unconditional)
+#############################################
+def iterative_denoise_unconditional(model, x1, iterations=3, alpha_bar=0.9, device="cuda"):
+    """
+    Iteratively applies the one-step unconditional denoiser.
+    
+    Args:
+        model: The trained unconditional one-step denoiser.
+        x1: Initial noisy image.
+        iterations: Number of refinement iterations (experiment between 1 and 8).
+        alpha_bar: Fixed diffusion parameter.
+        device: Device for computation.
+    
+    Returns:
+        Final refined image.
+    """
+    model.eval()
+    x_iter = x1.clone().to(device)
+    batch_size = x_iter.size(0)
+    t = torch.ones(batch_size, device=device, dtype=torch.long)
+    sqrt_alpha_bar = math.sqrt(alpha_bar)
+    sqrt_one_minus_alpha_bar = math.sqrt(1 - alpha_bar)
+    with torch.no_grad():
+        for i in range(iterations):
+            predicted_noise = model(x_iter, t)
+            x_iter = sqrt_alpha_bar * x_iter - sqrt_one_minus_alpha_bar * predicted_noise
+    return x_iter
+
+#############################################
+# Example Usage
+#############################################
+if __name__ == "__main__":
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Hyperparameters.
+    image_size = 32  # You can set 32 or 96.
+    epochs = 5
+    
+    # Dummy dataloader: a list with one batch of random clean images.
+    dummy_x0 = torch.randn(8, 1, image_size, image_size)  # Clean images.
+    dataloader = [dummy_x0]  # In practice, use a proper DataLoader.
+    
+    # Instantiate the unconditional denoising model.
+    model = UnconditionalDenoisingNet(in_channels=1, base_channels=64, time_emb_dim=128)
+    model.to(device)
+    
+    # Train the model.
+    train_unconditional(model, dataloader, epochs=epochs, image_size=image_size,
+                        alpha_bar=0.9, mu_range=(-0.1, 0.1), sigma_range=(0.05, 0.2),
+                        lambda_col=1.0, device=device)
+    
+    # Inference: generate a noisy image using the forward process.
+    batch_size, _, H, W = dummy_x0.shape
+    # Generate heterogeneous noise column-wise.
+    mu = torch.rand(batch_size, 1, 1, W, device=device) * (0.1 - (-0.1)) + (-0.1)
+    sigma = torch.rand(batch_size, 1, 1, W, device=device) * (0.2 - 0.05) + 0.05
+    noise = mu + sigma * torch.randn(batch_size, 1, H, W, device=device)
+    sqrt_alpha_bar = math.sqrt(0.9)
+    sqrt_one_minus_alpha_bar = math.sqrt(1 - 0.9)
+    x1 = sqrt_alpha_bar * dummy_x0.to(device) + sqrt_one_minus_alpha_bar * noise
+    
+    # One-step denoising.
+    x0_pred = denoise_one_step_unconditional(model, x1, alpha_bar=0.9, device=device)
+    # Iterative refinement: e.g., 4 iterations.
+    x0_refined = iterative_denoise_unconditional(model, x1, iterations=4, alpha_bar=0.9, device=device)
+    
+    # For DPS sampling, we need a measurement y; here we use dummy_x0.
+    generated = sample_dps_unconditional(model, (8, 1, image_size, image_size), dummy_x0.to(device),
+                                         timesteps=1000, beta_start=0.0001, beta_end=0.02,
+                                         gamma=0.1, device=device)
+    
+    print("One-step denoised image shape:", x0_pred.shape)
+    print("Iteratively refined image shape:", x0_refined.shape)
+    print("Generated sample shape (DPS):", generated.shape)
