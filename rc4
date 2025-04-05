@@ -335,4 +335,14 @@ For each training batch, a random diffusion step is chosen and the noisy image x
 	3.	Inference Pipeline (DPS):
 The reverse diffusion loop starts from pure noise. At each time step the model predicts v and computes a standard DDPM–like update. In addition, a likelihood gradient (here, a simple difference between the downsampled prior and the current sample) is computed and added (scaled by \gamma) to steer the sample toward the high‑resolution prior. This is the DPS twist.
 
-This solution co–optimizes the denoising network with prior conditio
+This solution co–optimizes the denoising network with prior condition
+
+I need these modifications 
+
+Modify it based on the requests I provide earlier. Now I will provide a list of modifications, read it and understand, ask question before start modifying. Request for modifications are
+1. We want to denoise for single step, ie, the noisy image will be a perfect noise free image with one step of Gaussian noise added. Modify the forward pass and training, inferencing. 
+2. Although it is one step noise, the noise is heterogeneous. To be specific, the mean and variance of Gaussian is different between columns. （one mean and standard deviation for one column, all rows in that column has same mean and standard deviation). We can train a separate model to ‘predict’ the mean and variance. Or use a predetermined mean/variance map as input.
+3. Option to train the model with gpu if available
+4. Input image size of 96 by 96 image. Or 32 by 32. It is an hyperparameter.
+5. For the model(code blocks) that requires prior. An hyperparameter to determine how much to downsample the prior to match the image resolution. It range from 1 to 8. 
+6. After model is train. Add a finetuning model step to update the model so that we can pass the noisy image and iteratively perform denoise step. Doing one step each time. 
