@@ -330,3 +330,133 @@ Explanation
 – At each step, the conditioned model predicts v and the estimated x_0 is used to update the latent.
 
 This complete pipeline demonstrates how to co–optimize a rectified flow denoising model with cross–channel attention and a prior consistency loss—all the “tricks” we discussed—to guide the reverse diffusion process with high–resolution prior information.
+
+
+===
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+#############################################
+# Helper: Time Embedding
+#############################################
+def get_timestep_embedding(timesteps, embedding_dim):
+    """
+    Generate sinusoidal embeddings for time steps.
+    Although our one-step denoising always uses t=1, this function is kept for compatibility.
+    
+    timesteps: Tensor of shape (n,) containing integer time steps.
+    embedding_dim: Dimension of the embedding vector.
+    """
+    half_dim = embedding_dim // 2
+    emb = math.log(10000) / (half_dim - 1)
+    emb = torch.exp(torch.arange(half_dim, device=timesteps.device) * -emb)
+    emb = timesteps.float().unsqueeze(1) * emb.unsqueeze(0)
+    emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
+    if embedding_dim % 2 == 1:
+        emb = F.pad(emb, (0, 1))
+    return emb
+
+#############################################
+# Attention Blocks
+#############################################
+class ChannelAttention(nn.Module):
+    def __init__(self, in_channels, reduction=16):
+        """
+        Standard channel attention using global average pooling and a small FC network.
+        """
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(in_channels, in_channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(in_channels // reduction, in_channels, bias=False),
+            nn.Sigmoid()
+        )
+        
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y
+
+class CrossChannelAttention(nn.Module):
+    def __init__(self, in_channels, reduction=16):
+        """
+        Cross-channel attention: uses conditioning features (from the prior branch) to reweight the main features.
+        """
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(in_channels, in_channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(in_channels // reduction, in_channels, bias=False),
+            nn.Sigmoid()
+        )
+        
+    def forward(self, x, cond):
+        # cond is assumed to have the same channel dimension as x.
+        b, c, _, _ = cond.size()
+        cond_pool = F.adaptive_avg_pool2d(cond, 1).view(b, c)
+        attn = self.fc(cond_pool).view(b, c, 1, 1)
+        return x * attn
+
+#############################################
+# Residual Block with Cross–Channel Attention
+#############################################
+class ResidualBlockWithCrossAttention(nn.Module):
+    def __init__(self, in_channels, out_channels, time_emb_dim, reduction=16):
+        """
+        A residual block that:
+          - Applies two 3×3 convolutions.
+          - Injects a time embedding.
+          - Applies standard channel attention.
+          - Applies cross–channel attention if conditioning features are provided.
+          - Uses a skip connection (with a 1×1 conv if needed).
+        """
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.time_emb_proj = nn.Linear(time_emb_dim, out_channels)
+        self.activation = nn.ReLU(inplace=True)
+        self.skip_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else None
+        self.channel_attention = ChannelAttention(out_channels, reduction=reduction)
+        self.cross_attention = CrossChannelAttention(out_channels, reduction=reduction)
+    
+    def forward(self, x, t_emb, cond=None):
+        h = self.activation(self.conv1(x))
+        # Inject time embedding.
+        t_emb_proj = self.time_emb_proj(t_emb).unsqueeze(-1).unsqueeze(-1)
+        h = h + t_emb_proj
+        h = self.conv2(h)
+        h = self.channel_attention(h)
+        if cond is not None:
+            h = self.cross_attention(h, cond)
+        if self.skip_conv is not None:
+            x = self.skip_conv(x)
+        return self.activation(h + x)
+
+#############################################
+# Prior Encoder with Downsampling Hyperparameter
+#############################################
+class HighResPriorEncoder(nn.Module):
+    def __init__(self, in_channels=3, feature_channels=16, downsample_factor=2):
+        """
+        A simple encoder that downsamples a high-resolution prior image to produce conditioning features.
+        
+        Args:
+            in_channels (int): Number of channels of the high-res prior.
+            feature_channels (int): Number of channels in the output features.
+            downsample_factor (int): Number of times to downsample by a factor of 2 (range 1 to 8).
+        """
+        super().__init__()
+        layers = []
+        for i in range(downsample_factor):
+            # For the first layer, use in_channels; then feature_channels.
+            conv_in = in_channels if i == 0 else feature_channels
+            layers.append(nn.Conv2d(conv_in, feature_channels, kernel_size=3, stride=2, padding=1))
+            layers.append(nn.ReLU(inplace=True))
+        self.encoder = nn.Sequential(*layers)
+    
+    def forward(self, x):
+        return self.encoder(x)
