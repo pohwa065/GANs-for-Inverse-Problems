@@ -162,3 +162,103 @@ if __name__ == '__main__':
     )
 
     print("Top extreme values (approx.):", extremes)
+
+
+
+=======
+import numpy as np
+from scipy.integrate import quad
+from scipy.optimize import root_scalar, minimize_scalar
+from scipy.stats import norm
+
+# --- Characteristic Function Based Inversion ---
+def cf_sample(t, mu_A, sigma_A, lambda_B, k_C, theta_C):
+    cf_A = np.exp(1j * mu_A * t - 0.5 * sigma_A**2 * t**2)
+    cf_B = np.exp(lambda_B * (np.exp(1j * t) - 1))
+    cf_C = (1 - 1j * theta_C * t) ** (-k_C)
+    return cf_A * cf_B * cf_C
+
+def gil_pelaez_cdf(x, mu_A, sigma_A, lambda_B, k_C, theta_C):
+    integrand = lambda t: np.imag(np.exp(-1j * t * x) * cf_sample(t, mu_A, sigma_A, lambda_B, k_C, theta_C)) / t
+    integral, _ = quad(integrand, 1e-10, 100, limit=500)
+    return 0.5 - (1 / np.pi) * integral
+
+def compute_extreme_quantiles_cf(mu_A, sigma_A, lambda_B, k_C, theta_C, num_samples, top_n=10):
+    target_probs = [1 - (k - 0.5) / num_samples for k in range(1, top_n + 1)]
+    quantiles = []
+
+    for p in target_probs:
+        result = root_scalar(
+            lambda x: gil_pelaez_cdf(x, mu_A, sigma_A, lambda_B, k_C, theta_C) - p,
+            bracket=[-100, 1000], method='brentq'
+        )
+        if not result.converged:
+            raise RuntimeError("Quantile root finding did not converge")
+        quantiles.append(result.root)
+
+    return np.array(quantiles)
+
+# --- Saddlepoint Approximation ---
+def K(t, mu_A, sigma_A, lambda_B, k_C, theta_C):
+    return mu_A * t + 0.5 * sigma_A**2 * t**2 + lambda_B * (np.exp(t) - 1) - k_C * np.log(1 - theta_C * t)
+
+def K_prime(t, mu_A, sigma_A, lambda_B, k_C, theta_C):
+    return mu_A + sigma_A**2 * t + lambda_B * np.exp(t) + (k_C * theta_C) / (1 - theta_C * t)
+
+def K_double_prime(t, sigma_A, lambda_B, k_C, theta_C):
+    return sigma_A**2 + lambda_B * np.exp(t) + (k_C * theta_C**2) / (1 - theta_C * t)**2
+
+def saddlepoint_tail_prob(q, mu_A, sigma_A, lambda_B, k_C, theta_C):
+    # Solve K'(t) = q for t (saddlepoint)
+    result = root_scalar(
+        lambda t: K_prime(t, mu_A, sigma_A, lambda_B, k_C, theta_C) - q,
+        bracket=[-0.1, 1 / (theta_C + 1e-9)], method='brentq'
+    )
+    if not result.converged:
+        raise RuntimeError("Saddlepoint equation did not converge")
+    t_hat = result.root
+
+    K_val = K(t_hat, mu_A, sigma_A, lambda_B, k_C, theta_C)
+    Kpp = K_double_prime(t_hat, sigma_A, lambda_B, k_C, theta_C)
+
+    w = np.sign(t_hat) * np.sqrt(2 * (t_hat * q - K_val))
+    u = t_hat * np.sqrt(Kpp)
+    tail_prob = norm.sf(w) + norm.pdf(w) * (1/w - 1/u)
+    return tail_prob
+
+def compute_extreme_quantiles_saddlepoint(mu_A, sigma_A, lambda_B, k_C, theta_C, num_samples, top_n=10):
+    target_probs = [(k - 0.5) / num_samples for k in range(1, top_n + 1)]
+    quantiles = []
+
+    for p in target_probs:
+        result = root_scalar(
+            lambda q: saddlepoint_tail_prob(q, mu_A, sigma_A, lambda_B, k_C, theta_C) - p,
+            bracket=[-100, 1000], method='brentq'
+        )
+        if not result.converged:
+            raise RuntimeError("Quantile root finding (saddlepoint) did not converge")
+        quantiles.append(result.root)
+
+    return np.array(quantiles)
+
+# Example usage
+if __name__ == '__main__':
+    params = {
+        'mu_A': 0,
+        'sigma_A': 1,
+        'lambda_B': 5,
+        'k_C': 2,
+        'theta_C': 2,
+        'num_samples': 1e12,
+        'top_n': 10
+    }
+
+    print("Using Characteristic Function Inversion:")
+    q_cf = compute_extreme_quantiles_cf(**params)
+    print(q_cf)
+
+    print("\nUsing Saddlepoint Approximation:")
+    q_sp = compute_extreme_quantiles_saddlepoint(**params)
+    print(q_sp)
+
+
