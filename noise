@@ -165,100 +165,57 @@ if __name__ == '__main__':
 
 
 
-=======
+====
+
 import numpy as np
-from scipy.integrate import quad
-from scipy.optimize import root_scalar, minimize_scalar
-from scipy.stats import norm
+from scipy.stats import norm, poisson, gamma, linregress
 
-# --- Characteristic Function Based Inversion ---
-def cf_sample(t, mu_A, sigma_A, lambda_B, k_C, theta_C):
-    cf_A = np.exp(1j * mu_A * t - 0.5 * sigma_A**2 * t**2)
-    cf_B = np.exp(lambda_B * (np.exp(1j * t) - 1))
-    cf_C = (1 - 1j * theta_C * t) ** (-k_C)
-    return cf_A * cf_B * cf_C
+def simulate_and_estimate_alpha(mu_A, sigma_A, lambda_B, k_C, theta_C, sample_size=int(1e8), tail_fraction=1e-4):
+    """
+    Simulate samples to estimate tail exponent alpha reliably.
 
-def gil_pelaez_cdf(x, mu_A, sigma_A, lambda_B, k_C, theta_C):
-    integrand = lambda t: np.imag(np.exp(-1j * t * x) * cf_sample(t, mu_A, sigma_A, lambda_B, k_C, theta_C)) / t
-    integral, _ = quad(integrand, 1e-10, 100, limit=500)
-    return 0.5 - (1 / np.pi) * integral
+    Parameters:
+        mu_A, sigma_A: Parameters for Gaussian
+        lambda_B: Parameter for Poisson
+        k_C, theta_C: Parameters for Gamma
+        sample_size: Number of samples to simulate
+        tail_fraction: Fraction of top samples to use for tail fitting
 
-def compute_extreme_quantiles_cf(mu_A, sigma_A, lambda_B, k_C, theta_C, num_samples, top_n=10):
-    target_probs = [1 - (k - 0.5) / num_samples for k in range(1, top_n + 1)]
-    quantiles = []
+    Returns:
+        float: Estimated tail exponent alpha
+    """
+    np.random.seed(42)
+    
+    # Generate samples
+    sample_A = np.random.normal(mu_A, sigma_A, sample_size)
+    sample_B = np.random.poisson(lambda_B, sample_size)
+    sample_C = np.random.gamma(k_C, theta_C, sample_size)
 
-    for p in target_probs:
-        result = root_scalar(
-            lambda x: gil_pelaez_cdf(x, mu_A, sigma_A, lambda_B, k_C, theta_C) - p,
-            bracket=[-100, 1000], method='brentq'
-        )
-        if not result.converged:
-            raise RuntimeError("Quantile root finding did not converge")
-        quantiles.append(result.root)
+    samples = sample_A + sample_B + sample_C
 
-    return np.array(quantiles)
+    # Sort samples to get tail
+    sorted_samples = np.sort(samples)
+    tail_start_idx = int((1 - tail_fraction) * sample_size)
+    tail_samples = sorted_samples[tail_start_idx:]
 
-# --- Saddlepoint Approximation ---
-def K(t, mu_A, sigma_A, lambda_B, k_C, theta_C):
-    return mu_A * t + 0.5 * sigma_A**2 * t**2 + lambda_B * (np.exp(t) - 1) - k_C * np.log(1 - theta_C * t)
+    # Empirical survival probabilities
+    survival_probs = np.linspace(tail_fraction, 1/sample_size, len(tail_samples))
 
-def K_prime(t, mu_A, sigma_A, lambda_B, k_C, theta_C):
-    return mu_A + sigma_A**2 * t + lambda_B * np.exp(t) + (k_C * theta_C) / (1 - theta_C * t)
+    # Linear regression on log-tail probabilities vs tail samples
+    slope, intercept, _, _, _ = linregress(tail_samples, np.log(survival_probs))
 
-def K_double_prime(t, sigma_A, lambda_B, k_C, theta_C):
-    return sigma_A**2 + lambda_B * np.exp(t) + (k_C * theta_C**2) / (1 - theta_C * t)**2
+    alpha_estimated = -slope
 
-def saddlepoint_tail_prob(q, mu_A, sigma_A, lambda_B, k_C, theta_C):
-    # Solve K'(t) = q for t (saddlepoint)
-    result = root_scalar(
-        lambda t: K_prime(t, mu_A, sigma_A, lambda_B, k_C, theta_C) - q,
-        bracket=[-0.1, 1 / (theta_C + 1e-9)], method='brentq'
-    )
-    if not result.converged:
-        raise RuntimeError("Saddlepoint equation did not converge")
-    t_hat = result.root
+    return alpha_estimated
 
-    K_val = K(t_hat, mu_A, sigma_A, lambda_B, k_C, theta_C)
-    Kpp = K_double_prime(t_hat, sigma_A, lambda_B, k_C, theta_C)
-
-    w = np.sign(t_hat) * np.sqrt(2 * (t_hat * q - K_val))
-    u = t_hat * np.sqrt(Kpp)
-    tail_prob = norm.sf(w) + norm.pdf(w) * (1/w - 1/u)
-    return tail_prob
-
-def compute_extreme_quantiles_saddlepoint(mu_A, sigma_A, lambda_B, k_C, theta_C, num_samples, top_n=10):
-    target_probs = [(k - 0.5) / num_samples for k in range(1, top_n + 1)]
-    quantiles = []
-
-    for p in target_probs:
-        result = root_scalar(
-            lambda q: saddlepoint_tail_prob(q, mu_A, sigma_A, lambda_B, k_C, theta_C) - p,
-            bracket=[-100, 1000], method='brentq'
-        )
-        if not result.converged:
-            raise RuntimeError("Quantile root finding (saddlepoint) did not converge")
-        quantiles.append(result.root)
-
-    return np.array(quantiles)
-
-# Example usage
+# Example usage:
 if __name__ == '__main__':
-    params = {
-        'mu_A': 0,
-        'sigma_A': 1,
-        'lambda_B': 5,
-        'k_C': 2,
-        'theta_C': 2,
-        'num_samples': 1e12,
-        'top_n': 10
-    }
+    alpha = simulate_and_estimate_alpha(
+        mu_A=0, sigma_A=1,
+        lambda_B=5,
+        k_C=2, theta_C=2,
+        sample_size=int(1e8),
+        tail_fraction=1e-4
+    )
 
-    print("Using Characteristic Function Inversion:")
-    q_cf = compute_extreme_quantiles_cf(**params)
-    print(q_cf)
-
-    print("\nUsing Saddlepoint Approximation:")
-    q_sp = compute_extreme_quantiles_saddlepoint(**params)
-    print(q_sp)
-
-
+    print("Estimated tail exponent alpha:", alpha)
