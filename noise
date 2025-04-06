@@ -94,3 +94,71 @@ plt.ylabel('Density')
 plt.title('Histogram of New Samples vs. Saved PDF')
 plt.legend()
 plt.show()
+
+
+
+
+
+
+
+=======
+import numpy as np
+from scipy.optimize import minimize_scalar
+
+def compute_top_extremes(mu_A, sigma_A, lambda_B, k_C, theta_C, num_samples, top_n=10):
+    """
+    Compute approximate top extreme values analytically for sum of Gaussian(A), Poisson(B), Gamma(C).
+
+    Parameters:
+        mu_A, sigma_A: Mean and std deviation for Gaussian distribution
+        lambda_B: Lambda for Poisson distribution
+        k_C, theta_C: Shape and scale for Gamma distribution
+        num_samples: Total number of samples drawn (e.g., 1e12)
+        top_n: Number of top extremes desired
+
+    Returns:
+        np.array: Array of approximate top extreme values
+    """
+
+    # Moment Generating Functions (MGFs)
+    def mgf(t):
+        if t >= 1/theta_C:
+            return np.inf
+        mgf_A = np.exp(mu_A * t + 0.5 * sigma_A**2 * t**2)
+        mgf_B = np.exp(lambda_B * (np.exp(t) - 1))
+        mgf_C = (1 - theta_C * t) ** (-k_C)
+        return mgf_A * mgf_B * mgf_C
+
+    # Chernoff bound: saddle-point to compute tail exponent alpha
+    def saddle_point(t):
+        return np.log(mgf(t)) - t
+
+    res = minimize_scalar(lambda t: saddle_point(t), bounds=(0, 1/(2*theta_C)), method='bounded')
+
+    if not res.success:
+        raise RuntimeError("Failed to numerically compute tail exponent alpha")
+
+    t_opt = res.x
+    alpha = t_opt
+
+    # EVT Gumbel approximation for exponential-like tail
+    gamma_euler = 0.5772156649
+    extreme_location = (np.log(num_samples) + gamma_euler + np.log(np.log(num_samples))) / alpha
+
+    # Spacing for top_n extremes is approximately O(1/alpha)
+    spacing = 1 / alpha
+    extremes = extreme_location + spacing * np.log(np.arange(top_n, 0, -1))
+
+    return extremes
+
+# Example usage:
+if __name__ == '__main__':
+    extremes = compute_top_extremes(
+        mu_A=0, sigma_A=1, 
+        lambda_B=5, 
+        k_C=2, theta_C=2, 
+        num_samples=1e12,
+        top_n=10
+    )
+
+    print("Top extreme values (approx.):", extremes)
