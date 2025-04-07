@@ -281,21 +281,27 @@ Modify it based on the requests I provide earlier. Now I will provide a list of 
 5. For the model(code blocks) that requires prior. An hyperparameter to determine how much to downsample the prior to match the image resolution. It range from 1 to 8. 
 6. After model is train. Add a finetuning model step to update the model so that we can pass the noisy image and iteratively perform denoise step. Doing one step each time. 
 
-====
+=====
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-#############################################
+###############################
 # Helper: Time Embedding
-#############################################
+###############################
 def get_timestep_embedding(timesteps, embedding_dim):
     """
     Generates sinusoidal embeddings for time steps.
+    (Even though we fix t = 1 for one-step denoising, this remains for compatibility.)
     
-    timesteps: Tensor of shape (n,) containing time step integers.
-    embedding_dim: Dimension of the embedding vector.
+    Args:
+        timesteps: Tensor of shape (n,) containing integer time steps.
+        embedding_dim: Dimension of the embedding vector.
+        
+    Returns:
+        Tensor of shape (n, embedding_dim).
     """
     half_dim = embedding_dim // 2
     emb = math.log(10000) / (half_dim - 1)
@@ -306,13 +312,13 @@ def get_timestep_embedding(timesteps, embedding_dim):
         emb = F.pad(emb, (0, 1))
     return emb
 
-#############################################
-# Denoising Network (Rectified Flow, v-prediction)
-#############################################
+###############################
+# Attention Blocks
+###############################
 class ChannelAttention(nn.Module):
     def __init__(self, in_channels, reduction=16):
         """
-        Standard channel attention block.
+        Standard channel attention via global pooling.
         """
         super().__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
@@ -329,10 +335,38 @@ class ChannelAttention(nn.Module):
         y = self.fc(y).view(b, c, 1, 1)
         return x * y
 
-class ResidualBlockWithAttention(nn.Module):
+class CrossChannelAttention(nn.Module):
+    def __init__(self, in_channels, reduction=16):
+        """
+        Cross-channel attention uses conditioning features to reweight the main features.
+        """
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(in_channels, in_channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(in_channels // reduction, in_channels, bias=False),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, x, cond):
+        # cond is assumed to have the same channel dimension as x.
+        b, c, _, _ = cond.size()
+        cond_pool = F.adaptive_avg_pool2d(cond, 1).view(b, c)
+        attn = self.fc(cond_pool).view(b, c, 1, 1)
+        return x * attn
+
+###############################
+# Residual Block with Cross–Channel Attention
+###############################
+class ResidualBlockWithCrossAttention(nn.Module):
     def __init__(self, in_channels, out_channels, time_emb_dim, reduction=16):
         """
-        Residual block that injects time embedding and applies channel attention.
+        A residual block that:
+          - Applies two 3x3 convolutions.
+          - Injects a time embedding.
+          - Applies standard channel attention.
+          - Applies cross-channel attention if conditioning is provided.
+          - Uses a skip connection (with a 1x1 conv if needed).
         """
         super().__init__()
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
@@ -341,60 +375,117 @@ class ResidualBlockWithAttention(nn.Module):
         self.activation = nn.ReLU(inplace=True)
         self.skip_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else None
         self.channel_attention = ChannelAttention(out_channels, reduction=reduction)
+        self.cross_attention = CrossChannelAttention(out_channels, reduction=reduction)
     
-    def forward(self, x, t_emb):
+    def forward(self, x, t_emb, cond=None):
         h = self.activation(self.conv1(x))
         t_emb_proj = self.time_emb_proj(t_emb).unsqueeze(-1).unsqueeze(-1)
         h = h + t_emb_proj
         h = self.conv2(h)
         h = self.channel_attention(h)
+        if cond is not None:
+            h = self.cross_attention(h, cond)
         if self.skip_conv is not None:
             x = self.skip_conv(x)
         return self.activation(h + x)
 
-class DenoisingNet(nn.Module):
-    def __init__(self, in_channels=1, base_channels=64, time_emb_dim=128, reduction=16):
+###############################
+# Prior Encoder with Downsampling Hyperparameter
+###############################
+class HighResPriorEncoder(nn.Module):
+    def __init__(self, in_channels=3, feature_channels=16, downsample_factor=2):
         """
-        Rectified flow network for velocity (v) prediction.
-        It receives a noisy image and time step, then outputs the predicted velocity.
+        An encoder that downsamples a high-resolution prior image to produce conditioning features.
+        
+        Args:
+            in_channels: Number of channels in the high-res prior.
+            feature_channels: Number of channels in the output features.
+            downsample_factor: Number of times to downsample by a factor of 2 (range: 1 to 8).
+        """
+        super().__init__()
+        layers = []
+        for i in range(downsample_factor):
+            conv_in = in_channels if i == 0 else feature_channels
+            layers.append(nn.Conv2d(conv_in, feature_channels, kernel_size=3, stride=2, padding=1))
+            layers.append(nn.ReLU(inplace=True))
+        self.encoder = nn.Sequential(*layers)
+    
+    def forward(self, x):
+        return self.encoder(x)
+
+###############################
+# Main Model: V_Prediction_CrossAttn_Model (Conditional One-Step Denoising)
+###############################
+class V_Prediction_CrossAttn_Model(nn.Module):
+    def __init__(self, in_channels=1, base_channels=64, time_emb_dim=128,
+                 prior_in_channels=3, prior_feature_channels=16, downsample_factor=2, reduction=16):
+        """
+        U–Net for velocity (v) prediction in a one-step denoising task.
+        Incorporates:
+          - A sinusoidal time embedding (t is fixed to 1 during training/inference).
+          - A shallow residual block with channel and cross-channel attention.
+          - Conditioning from a high-res prior via a prior encoder.
+        
+        Args:
+            in_channels: Number of channels in the low-res image (1).
+            base_channels: Base number of feature channels.
+            time_emb_dim: Dimension of the time embedding.
+            prior_in_channels: Number of channels in the high-res prior (e.g., 3).
+            prior_feature_channels: Number of feature channels output by the prior encoder.
+            downsample_factor: How many times to downsample the high-res prior (range: 1 to 8).
+            reduction: Reduction factor for attention modules.
         """
         super().__init__()
         self.time_emb_dim = time_emb_dim
         self.time_proj = nn.Linear(time_emb_dim, time_emb_dim)
-        self.conv_in = nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1)
-        self.resblock1 = ResidualBlockWithAttention(base_channels, base_channels, time_emb_dim, reduction)
-        self.downsample = nn.Conv2d(base_channels, base_channels * 2, kernel_size=3, stride=2, padding=1)
-        self.resblock2 = ResidualBlockWithAttention(base_channels * 2, base_channels * 2, time_emb_dim, reduction)
-        self.resblock3 = ResidualBlockWithAttention(base_channels * 2, base_channels * 2, time_emb_dim, reduction)
-        self.upsample = nn.ConvTranspose2d(base_channels * 2, base_channels, kernel_size=4, stride=2, padding=1)
-        self.resblock4 = ResidualBlockWithAttention(base_channels, base_channels, time_emb_dim, reduction)
+        
+        # Prior encoder with downsample_factor.
+        self.prior_encoder = HighResPriorEncoder(prior_in_channels, prior_feature_channels, downsample_factor)
+        # Upsample the extracted prior features to match the low-res image size.
+        self.prior_upsample = nn.Sequential(
+            nn.ConvTranspose2d(prior_feature_channels, prior_feature_channels, kernel_size=4, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(prior_feature_channels, prior_feature_channels, kernel_size=4, stride=2, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        
+        # Shallow U-Net encoder: concatenate the low-res image with upsampled prior features.
+        self.conv_in = nn.Conv2d(in_channels + prior_feature_channels, base_channels, kernel_size=3, padding=1)
+        self.resblock1 = ResidualBlockWithCrossAttention(base_channels, base_channels, time_emb_dim, reduction)
         self.conv_out = nn.Conv2d(base_channels, in_channels, kernel_size=3, padding=1)
-    
-    def forward(self, x, t):
+
+    def forward(self, x, t, high_res_prior):
         """
-        x: Noisy image of shape (n, in_channels, H, W)
-        t: Time step tensor of shape (n,)
+        Args:
+            x: Noisy low-res image, shape (n, in_channels, H, W)
+            t: Time step tensor (should be fixed to 1), shape (n,)
+            high_res_prior: High-res prior image, shape (n, prior_in_channels, H_hr, W_hr)
+        
+        Returns:
+            Predicted noise (to be used for inversion).
         """
         t_emb = get_timestep_embedding(t, self.time_emb_dim)
         t_emb = self.time_proj(t_emb)
-        h = self.conv_in(x)
-        h = self.resblock1(h, t_emb)
-        h = self.downsample(h)
-        h = self.resblock2(h, t_emb)
-        h = self.resblock3(h, t_emb)
-        h = self.upsample(h)
-        h = self.resblock4(h, t_emb)
+        
+        # Process high-res prior.
+        prior_features = self.prior_encoder(high_res_prior)
+        prior_features = self.prior_upsample(prior_features)  # Shape: (n, prior_feature_channels, H, W)
+        
+        # Concatenate the noisy image and prior features.
+        x_in = torch.cat([x, prior_features], dim=1)
+        h = self.conv_in(x_in)
+        h = self.resblock1(h, t_emb, cond=prior_features)
         out = self.conv_out(h)
-        return out  # Predicted velocity v
+        return out  # Predicted noise
 
-#############################################
+###############################
 # Prior Consistency Module
-#############################################
+###############################
 class PriorConsistencyNet(nn.Module):
     def __init__(self, in_channels=1, embed_dim=64):
         """
         A small network that extracts an embedding from an image.
-        We use it to compare the denoised image and the prior (after downsampling).
+        Used to compare the denoised image and the prior (after downsampling).
         """
         super().__init__()
         self.conv1 = nn.Conv2d(in_channels, embed_dim, kernel_size=3, padding=1)
@@ -409,160 +500,162 @@ class PriorConsistencyNet(nn.Module):
         return h
 
 #############################################
-# Training Pipeline: Co-optimizing Two Models
+# Training Pipeline: Co-optimizing Two Models (Modified for One-Step Denoising)
 #############################################
-def train_two_models(denoise_model, prior_model, dataloader, timesteps=1000,
-                     beta_start=0.0001, beta_end=0.02, epochs=100,
-                     lambda_prior=0.1, device="cuda"):
+def train_one_step_conditional(model, prior_model, dataloader, epochs=10, image_size=32,
+                               alpha_bar=0.9, mu_range=(-0.1, 0.1), sigma_range=(0.05, 0.2),
+                               lambda_prior=0.1, lambda_col=1.0, device="cuda"):
     """
-    Co-optimizes:
-      - The denoising network (using rectified flow loss).
-      - The prior consistency module (enforcing that the denoised image is similar in embedding space to the prior).
+    Train the conditional one-step denoiser.
     
-    dataloader: yields (x0, high_res_prior) where
-      • x0: Clean target image (n, 1, H, W).
-      • high_res_prior: High-res conditioning image (n, 3, H_hr, W_hr).
+    For each clean image x0 (shape: [batch, 1, image_size, image_size]) and its high-res prior,
+    the forward process is:
+         x1 = sqrt(alpha_bar)*x0 + sqrt(1-alpha_bar)*noise,
+    where noise is sampled heterogeneously per column:
+         For each column, sample a mean (μ) and sigma (σ) from given ranges,
+         then for every pixel in that column, noise ~ N(μ, σ²).
+    
+    Losses:
+      - MSE loss between predicted noise and the actual noise.
+      - Column consistency loss: predicted noise should be nearly constant along rows in each column.
+      - Prior consistency loss: MSE loss between the denoised image (via inversion) and the downsampled prior.
     """
-    optimizer_denoise = torch.optim.Adam(denoise_model.parameters(), lr=1e-4)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     optimizer_prior = torch.optim.Adam(prior_model.parameters(), lr=1e-4)
-    
-    # Define the diffusion schedule.
-    betas = torch.linspace(beta_start, beta_end, timesteps, device=device)
-    alphas = 1.0 - betas
-    alpha_bars = torch.cumprod(alphas, dim=0)
-    
-    denoise_model.train()
+    model.train()
     prior_model.train()
+    sqrt_alpha_bar = math.sqrt(alpha_bar)
+    sqrt_one_minus_alpha_bar = math.sqrt(1 - alpha_bar)
     
     for epoch in range(epochs):
         for x0, high_res_prior in dataloader:
-            # x0: clean low-res image (n, 1, H, W)
-            # high_res_prior: high-res image (n, 3, H_hr, W_hr)
+            # x0: clean low-res image, shape (batch, 1, image_size, image_size)
+            # high_res_prior: high-res prior image, shape (batch, 3, H_prior, W_prior)
             x0 = x0.to(device)
             high_res_prior = high_res_prior.to(device)
-            batch_size = x0.size(0)
-            optimizer_denoise.zero_grad()
+            batch_size, _, H, W = x0.shape
+            optimizer.zero_grad()
             optimizer_prior.zero_grad()
             
-            # Sample a random time step t.
-            t = torch.randint(0, timesteps, (batch_size,), device=device).long()
-            alpha_bar_t = alpha_bars[t].view(batch_size, 1, 1, 1)
+            # Fixed t = 1 for one-step denoising.
+            t = torch.ones(batch_size, device=device, dtype=torch.long)
             
-            # Sample Gaussian noise.
-            noise = torch.randn_like(x0)
-            # Forward process: x_t = sqrt(alpha_bar_t)*x0 + sqrt(1-alpha_bar_t)*noise
-            x_t = torch.sqrt(alpha_bar_t) * x0 + torch.sqrt(1 - alpha_bar_t) * noise
-            # Ground-truth velocity.
-            v_true = torch.sqrt(alpha_bar_t) * noise - torch.sqrt(1 - alpha_bar_t) * x0
-            # Denoising network prediction.
-            v_pred = denoise_model(x_t, t)
-            v_loss = F.mse_loss(v_pred, v_true)
-            # Invert to obtain predicted clean image.
-            x0_pred = torch.sqrt(alpha_bar_t) * x_t - torch.sqrt(1 - alpha_bar_t) * v_pred
+            # Generate heterogeneous noise column-wise.
+            mu = torch.rand(batch_size, 1, 1, W, device=device) * (mu_range[1] - mu_range[0]) + mu_range[0]
+            sigma = torch.rand(batch_size, 1, 1, W, device=device) * (sigma_range[1] - sigma_range[0]) + sigma_range[0]
+            noise = mu + sigma * torch.randn(batch_size, 1, H, W, device=device)
             
-            # Process the high-res prior: downsample to x0 resolution and convert to grayscale.
+            # Forward process: x1 = sqrt(alpha_bar)*x0 + sqrt(1-alpha_bar)*noise.
+            x1 = sqrt_alpha_bar * x0 + sqrt_one_minus_alpha_bar * noise
+            
+            # Predict noise using the model.
+            predicted_noise = model(x1, t, high_res_prior)
+            loss_mse = F.mse_loss(predicted_noise, noise)
+            # Column consistency loss: for each column, force predicted noise to be nearly constant along rows.
+            pred_col_mean = predicted_noise.mean(dim=2, keepdim=True)
+            loss_col = F.mse_loss(predicted_noise, pred_col_mean)
+            
+            # Inversion: Estimate clean image: x0_pred = sqrt(alpha_bar)*x1 - sqrt(1-alpha_bar)*predicted_noise.
+            x0_pred = sqrt_alpha_bar * x1 - sqrt_one_minus_alpha_bar * predicted_noise
+            
+            # Prior consistency: downsample high_res_prior to match x0 resolution.
             prior_down = F.interpolate(high_res_prior, size=x0.shape[-2:], mode='bilinear', align_corners=False)
             if prior_down.size(1) == 3 and x0.size(1) == 1:
                 prior_down = prior_down.mean(dim=1, keepdim=True)
+            loss_prior = F.mse_loss(prior_model(x0_pred), prior_model(prior_down))
             
-            # Compute embeddings.
-            emb_pred = prior_model(x0_pred)
-            emb_prior = prior_model(prior_down)
-            consistency_loss = F.mse_loss(emb_pred, emb_prior)
-            
-            loss = v_loss + lambda_prior * consistency_loss
-            loss.backward()
-            optimizer_denoise.step()
+            total_loss = loss_mse + lambda_col * loss_col + lambda_prior * loss_prior
+            total_loss.backward()
+            optimizer.step()
             optimizer_prior.step()
-        print(f"Epoch {epoch+1}/{epochs} - Loss: {loss.item():.4f}")
+        print(f"Epoch {epoch+1}/{epochs} - Loss: {total_loss.item():.6f} | MSE: {loss_mse.item():.6f} | Col: {loss_col.item():.6f} | Prior: {loss_prior.item():.6f}")
 
 #############################################
-# Inference Pipeline (Sampling using Denoising Network Only)
+# Inference Pipeline: One-Step Conditional Denoising
 #############################################
-def sample_denoising_net(denoise_model, shape, timesteps=1000,
-                         beta_start=0.0001, beta_end=0.02, device="cuda"):
+def denoise_one_step_conditional(model, x1, high_res_prior, alpha_bar=0.9, device="cuda"):
     """
-    Generates a sample via the reverse diffusion process.
+    Given a noisy image x1 and a high-res prior, predict the noise (with t=1) and return the denoised image.
     
-    shape: Output shape (n, 1, H, W).
+    Inversion: x0_pred = sqrt(alpha_bar)*x1 - sqrt(1-alpha_bar)*predicted_noise.
     """
-    denoise_model.eval()
+    model.eval()
     with torch.no_grad():
-        betas = torch.linspace(beta_start, beta_end, timesteps, device=device)
-        alphas = 1.0 - betas
-        alpha_bars = torch.cumprod(alphas, dim=0)
-        x = torch.randn(shape, device=device)
-        for t in reversed(range(timesteps)):
-            batch_size = shape[0]
-            t_tensor = torch.full((batch_size,), t, device=device, dtype=torch.long)
-            alpha_bar_t = alpha_bars[t].view(batch_size, 1, 1, 1)
-            v_pred = denoise_model(x, t_tensor)
-            beta_t = betas[t]
-            mu_t = (1.0 / torch.sqrt(1.0 - beta_t)) * (x - (beta_t / torch.sqrt(1.0 - alpha_bar_t)) * v_pred)
-            if t > 0:
-                noise = torch.randn_like(x)
-                sigma_t = torch.sqrt(beta_t)
-                x = mu_t + sigma_t * noise
-            else:
-                x = mu_t
-        return x
+        batch_size = x1.size(0)
+        t = torch.ones(batch_size, device=device, dtype=torch.long)
+        predicted_noise = model(x1, t, high_res_prior)
+        sqrt_alpha_bar = math.sqrt(alpha_bar)
+        sqrt_one_minus_alpha_bar = math.sqrt(1 - alpha_bar)
+        x0_pred = sqrt_alpha_bar * x1 - sqrt_one_minus_alpha_bar * predicted_noise
+    return x0_pred
+
+#############################################
+# Iterative Refinement Function (Conditional)
+#############################################
+def iterative_denoise_conditional(model, x1, high_res_prior, iterations=3, alpha_bar=0.9, device="cuda"):
+    """
+    Iteratively apply the one-step conditional denoiser.
+    
+    Args:
+        model: The trained conditional one-step denoiser.
+        x1: Initial noisy image.
+        high_res_prior: High-res conditioning image.
+        iterations: Number of refinement iterations (experiment between 1 and 8).
+        alpha_bar: Diffusion parameter for one-step denoising.
+        device: Device for computation.
+    
+    Returns:
+        Final refined image.
+    """
+    model.eval()
+    x_iter = x1.clone().to(device)
+    for i in range(iterations):
+        x_iter = denoise_one_step_conditional(model, x_iter, high_res_prior, alpha_bar, device)
+    return x_iter
 
 #############################################
 # Example Usage
 #############################################
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # Instantiate the two models.
-    denoise_model = DenoisingNet(in_channels=1, base_channels=64, time_emb_dim=128, reduction=16)
+    
+    # Hyperparameters.
+    image_size = 32  # Can be set to 96 for larger images.
+    epochs = 5
+    downsample_factor = 2  # For the prior encoder (range: 1 to 8)
+    
+    # Dummy dataloader: one batch of random clean images and corresponding high-res priors.
+    dummy_x0 = torch.randn(8, 1, image_size, image_size)           # Clean low-res images.
+    dummy_prior = torch.randn(8, 3, image_size * 4, image_size * 4)    # High-res priors (e.g., 4× larger).
+    dataloader = [(dummy_x0, dummy_prior)]  # In practice, use a proper DataLoader.
+    
+    # Instantiate the conditional one-step denoising model and the prior consistency module.
+    model = V_Prediction_CrossAttn_Model(in_channels=1, base_channels=64, time_emb_dim=128,
+                                         prior_in_channels=3, prior_feature_channels=16,
+                                         downsample_factor=downsample_factor, reduction=16)
     prior_model = PriorConsistencyNet(in_channels=1, embed_dim=64)
-    denoise_model.to(device)
+    model.to(device)
     prior_model.to(device)
     
-    # Dummy dataloader: yields a list of one batch (for illustration).
-    dummy_x0 = torch.randn(8, 1, 32, 32)        # Low-res clean images.
-    dummy_prior = torch.randn(8, 3, 128, 128)     # High-res prior images.
-    dataloader = [(dummy_x0, dummy_prior)]
+    # Train the model.
+    train_one_step_conditional(model, prior_model, dataloader, epochs=epochs, image_size=image_size,
+                               alpha_bar=0.9, mu_range=(-0.1, 0.1), sigma_range=(0.05, 0.2),
+                               lambda_prior=0.1, lambda_col=1.0, device=device)
     
-    # Train for a few epochs.
-    train_two_models(denoise_model, prior_model, dataloader, timesteps=1000,
-                     beta_start=0.0001, beta_end=0.02, epochs=5,
-                     lambda_prior=0.1, device=device)
+    # Inference: Generate a noisy image using the forward process.
+    batch_size, _, H, W = dummy_x0.shape
+    # Generate heterogeneous noise column-wise.
+    mu = torch.rand(batch_size, 1, 1, W, device=device) * (0.1 - (-0.1)) + (-0.1)
+    sigma = torch.rand(batch_size, 1, 1, W, device=device) * (0.2 - 0.05) + 0.05
+    noise = mu + sigma * torch.randn(batch_size, 1, H, W, device=device)
+    sqrt_alpha_bar = math.sqrt(0.9)
+    sqrt_one_minus_alpha_bar = math.sqrt(1 - 0.9)
+    x1 = sqrt_alpha_bar * dummy_x0.to(device) + sqrt_one_minus_alpha_bar * noise
     
-    # Inference: generate a sample using the denoising network.
-    sample_shape = (8, 1, 32, 32)
-    generated = sample_denoising_net(denoise_model, sample_shape, timesteps=1000,
-                                     beta_start=0.0001, beta_end=0.02, device=device)
-    print("Generated sample shape:", generated.shape)
-
-
-
-
-
-
-⸻
-
-Explanation
-	1.	DenoisingNet:
-This network implements a rectified flow–style denoising model. It takes a noisy image x_t and a time step t and predicts the velocity v. We use a series of residual blocks with channel attention (to help highlight faint details).
-	2.	PriorConsistencyNet:
-A small convolutional network that produces an embedding from an image. During training, we downsample the high–resolution prior (and convert it to grayscale, if necessary) so its spatial dimensions match the denoised image x_0. The L₂ loss between the embeddings of the predicted x_0 and the processed prior enforces consistency.
-	3.	Training Pipeline:
-For each batch, we sample a time step and generate a noisy image via the forward diffusion process. The denoising network predicts v, which we invert to obtain x_0^{\text{pred}}. The velocity loss is computed between v_\text{pred} and the ground–truth v. Then the prior consistency module computes embeddings of both x_0^{\text{pred}} and a downsampled version of the high–resolution prior, and we compute an L₂ loss between them. The overall loss is the sum of these two (weighted by a factor \lambda), and both models are updated jointly.
-	4.	Inference:
-During sampling, only the denoising network is used to progressively reverse the diffusion process and generate a final image.
-
-This architecture lets you separately model the denoising and the prior consistency—and co-optimize them—to enforce that the generated image remains faithful to the high–resolution prior while performing well on the rectified flow task.
-
-
-=====
-I need these modifications 
-
-Modify it based on the requests I provide earlier. Now I will provide a list of modifications, read it and understand, ask question before start modifying. Request for modifications are
-1. We want to denoise for single step, ie, the noisy image will be a perfect noise free image with one step of Gaussian noise added. Modify the forward pass and training, inferencing. 
-2. Although it is one step noise, the noise is heterogeneous. To be specific, the mean and variance of Gaussian is different between columns. （one mean and standard deviation for one column, all rows in that column has same mean and standard deviation). We can train a separate model to ‘predict’ the mean and variance. Or use a predetermined mean/variance map as input.
-3. Option to train the model with gpu if available
-4. Input image size of 96 by 96 image. Or 32 by 32. It is an hyperparameter.
-5. For the model(code blocks) that requires prior. An hyperparameter to determine how much to downsample the prior to match the image resolution. It range from 1 to 8. 
-6. After model is train. Add a finetuning model step to update the model so that we can pass the noisy image and iteratively perform denoise step. Doing one step each time. 
-
-
+    # One-step denoising.
+    x0_pred = denoise_one_step_conditional(model, x1, dummy_prior.to(device), alpha_bar=0.9, device=device)
+    # Iterative refinement: e.g., 4 iterations.
+    x0_refined = iterative_denoise_conditional(model, x1, dummy_prior.to(device), iterations=4, alpha_bar=0.9, device=device)
+    
+    print("One-step denoised image shape:", x0_pred.shape)
+    print("Iteratively refined image shape:", x0_refined.shape)
