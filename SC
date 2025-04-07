@@ -1,0 +1,55 @@
+  
+    def calculate_speckle_fraction(self, field, x):
+        I = abs(field[0])**2 + abs(field[1])**2
+        dx = x[1] - x[0]
+        Fy, Fx = self.cfg.Coll.Filter
+        nx = np.round(self.cfg.Sensor.px*1e6*Fx/dx)
+        ny = np.round(self.cfg.Sensor.px*1e6*Fy*self.cfg.Sensor.binning/dx)
+        N = len(x)
+        Filt = np.zeros([N,N])
+        Filt[int(np.round((N+1)/2)-np.round(ny/2)):int(np.round((N+1)/2)+np.round(ny/2)), \
+             int(np.round((N+1)/2)-np.round(nx/2)):int(np.round((N+1)/2)+np.round(nx/2))] = 1.0
+        Kd = convolve2d(Filt, Filt, 'same')
+        Ad = np.sum(Filt)
+        mu_a2 = abs(np.fft.fftshift(np.fft.fft2(I))/np.sum(I))**2
+        c = 1/Ad*(np.sum(Kd*mu_a2))**0.5
+        return c
+
+    def generate_coord(self):
+        self.px=0.040625
+        self.ImR=10.4#um
+        self.N=int(self.ImR/self.px)
+        self.k=2*np.pi/(self.cfg.Illum.wavelength*1e6) #light k vector
+        self.dk=2*np.pi/self.ImR/self.k
+        self.x = self.px*np.linspace(-self.N/2,self.N/2,self.N+1)
+        self.X, self.Y = np.meshgrid(self.x, self.x)
+        self.kx=self.dk*np.linspace(-self.N/2,self.N/2,self.N+1)
+        self.KX, self.KY = np.meshgrid(self.kx, self.kx)
+        self.t = 91
+        self.p = 73
+        theta = np.linspace(0,90,self.t)
+        Theta = np.deg2rad(theta)
+        phi = np.linspace(0,360,self.p)
+        Phi = np.deg2rad(phi)
+        self.theta, self.phi = np.meshgrid(theta,phi)
+        self.Theta, self.Phi = np.meshgrid(Theta,Phi)
+        self.dTheta = self.Theta[1,1] - self.Theta[0,0]
+        self.dPhi = self.Phi[1,1] - self.Phi[0,0]
+
+
+# for usage 
+# config: Cfg
+
+[Illum]
+AOI = 75 #deg
+wavelength = 266e-9 # meters
+LL = 1 # recipe light level
+[Sensor]
+pixel_size = 0.335e-6 #meters
+col_num = 1276 #num
+[Collection]
+Filter = [2, 2] # [tangential, radial]
+
+# self.haze_field_xy[channel] = (257,257) matrix, known
+# explain 
+self.res[channel]['speckle_fraction'] = self.calculate_speckle_fraction(self.haze_field_xy[channel],self.x)
