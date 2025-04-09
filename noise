@@ -219,3 +219,102 @@ if __name__ == '__main__':
     )
 
     print("Estimated tail exponent alpha:", alpha)
+
+
+
+=========
+import numpy as np
+
+def compute_top_extreme_from_tail(tail_exponent, num_samples, tail_type='exponential', top_n=10):
+    """
+    Compute approximate top extremes based on estimated tail exponent.
+
+    Parameters:
+        tail_exponent: alpha for exponential tails or beta for Gaussian tails
+        num_samples: Total number of samples (e.g., 1e12)
+        tail_type: 'exponential' or 'gaussian'
+        top_n: number of extreme values required
+
+    Returns:
+        np.array: approximate top extreme values
+    """
+
+    if tail_type == 'exponential':
+        extreme_location = np.log(num_samples) / tail_exponent
+        spacing = 1 / tail_exponent
+        extremes = extreme_location + spacing * np.log(np.arange(top_n, 0, -1))
+        
+    elif tail_type == 'gaussian':
+        extreme_location = np.sqrt(np.log(num_samples) / tail_exponent)
+        spacing = (1 / (2 * extreme_location * tail_exponent))
+        extremes = extreme_location + spacing * np.log(np.arange(top_n, 0, -1))
+
+    else:
+        raise ValueError("tail_type must be 'exponential' or 'gaussian'")
+
+    return extremes
+
+# Example:
+alpha = 0.5  # Exponential tail estimated
+beta = 0.05  # Gaussian tail estimated
+num_samples = 1e12
+
+extremes_exp = compute_top_extreme_from_tail(alpha, num_samples, tail_type='exponential', top_n=10)
+extremes_gauss = compute_top_extreme_from_tail(beta, num_samples, tail_type='gaussian', top_n=10)
+
+print("Top extremes (Exponential tail):", extremes_exp)
+print("Top extremes (Gaussian tail):", extremes_gauss)
+
+====
+import numpy as np
+from scipy.stats import linregress
+
+def estimate_gaussian_tail(mu_A, sigma_A, lambda_B, k_C, theta_C, sample_size=int(1e8), tail_fraction=1e-4):
+    """
+    Estimate Gaussian-like tail parameter beta by numerical simulation.
+
+    Parameters:
+        mu_A, sigma_A: Parameters for Gaussian
+        lambda_B: Parameter for Poisson
+        k_C, theta_C: Parameters for Gamma
+        sample_size: Number of samples to simulate
+        tail_fraction: Fraction of top samples to use for tail fitting
+
+    Returns:
+        float: Estimated Gaussian tail exponent beta
+    """
+    np.random.seed(42)
+
+    # Generate samples
+    sample_A = np.random.normal(mu_A, sigma_A, sample_size)
+    sample_B = np.random.poisson(lambda_B, sample_size)
+    sample_C = np.random.gamma(k_C, theta_C, sample_size)
+
+    samples = sample_A + sample_B + sample_C
+
+    # Sort samples to extract tail
+    sorted_samples = np.sort(samples)
+    tail_start_idx = int((1 - tail_fraction) * sample_size)
+    tail_samples = sorted_samples[tail_start_idx:]
+
+    # Compute empirical survival probabilities
+    survival_probs = np.linspace(tail_fraction, 1/sample_size, len(tail_samples))
+
+    # Fit quadratic exponential tail: log P(X>x) ~ -beta x^2
+    slope, intercept, _, _, _ = linregress(tail_samples**2, np.log(survival_probs))
+
+    beta_estimated = -slope
+
+    return beta_estimated
+
+# Example usage:
+if __name__ == '__main__':
+    beta = estimate_gaussian_tail(
+        mu_A=0, sigma_A=1,
+        lambda_B=2,
+        k_C=0.5, theta_C=0.1,  # Gamma tail weaker than Gaussian
+        sample_size=int(1e8),
+        tail_fraction=1e-4
+    )
+
+    print("Estimated Gaussian-like tail exponent beta:", beta)
