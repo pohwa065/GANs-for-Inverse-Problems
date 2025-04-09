@@ -318,3 +318,110 @@ if __name__ == '__main__':
     )
 
     print("Estimated Gaussian-like tail exponent beta:", beta)
+
+
+==========
+
+import numpy as np
+import pandas as pd
+from scipy.stats import gamma, poisson, norm
+
+def compare_extreme_SNR(k, theta, lambda_B, mu_A, sigma_A, num_samples=int(1e7), quantile=1-1e-6):
+    np.random.seed(42)
+    
+    # Pure Gamma
+    samples_gamma = np.random.gamma(k, theta, num_samples)
+    extreme_gamma = np.quantile(samples_gamma, quantile)
+    std_gamma = np.std(samples_gamma)
+    SNR_gamma = extreme_gamma / std_gamma
+    
+    # Combined (Gamma + Poisson + Gaussian)
+    samples_combined = (
+        np.random.gamma(k, theta, num_samples) +
+        np.random.poisson(lambda_B, num_samples) +
+        np.random.normal(mu_A, sigma_A, num_samples)
+    )
+    extreme_combined = np.quantile(samples_combined, quantile)
+    std_combined = np.std(samples_combined)
+    SNR_combined = extreme_combined / std_combined
+    
+    result = {
+        'Pure Gamma': {'Extreme_Value': extreme_gamma, 'Std': std_gamma, 'SNR': SNR_gamma},
+        'Combined': {'Extreme_Value': extreme_combined, 'Std': std_combined, 'SNR': SNR_combined}
+    }
+    
+    return result
+
+# Define a function to compare SNR for different scale factors
+def compare_snr_scaled_gamma(scale_factor, k=5, theta=3, lambda_B=4, mu_A=2, sigma_A=2, num_samples=int(1e7), quantile=1-1e-6):
+    theta_pure = scale_factor * theta
+    result = compare_extreme_SNR(k, theta_pure, lambda_B, mu_A, sigma_A, num_samples, quantile)
+    
+    df_result = pd.DataFrame(result).T.reset_index().rename(columns={'index': 'Scenario'})
+    df_result['Gamma_Scale_Factor'] = scale_factor
+    return df_result
+
+# Test for multiple scale factors
+scale_factors = [1, 2, 3, 4, 5, 6, 7]
+all_results = pd.concat([compare_snr_scaled_gamma(sf) for sf in scale_factors], ignore_index=True)
+
+import ace_tools as tools; tools.display_dataframe_to_user(name="SNR Comparison Across Gamma Scale Factors", dataframe=all_results)
+
+
+======
+
+import numpy as np
+from scipy.stats import norm, poisson, gamma, linregress
+import pandas as pd
+
+def estimate_alpha_sensitivity_with_fraction(mu_A, sigma_A, lambda_B, k_C, theta_C, sample_size=int(1e7), tail_fractions=None):
+    """
+    Simulate samples and estimate alpha over a range of tail fractions to assess sensitivity.
+
+    Parameters:
+        mu_A, sigma_A: Gaussian parameters
+        lambda_B: Poisson parameter
+        k_C, theta_C: Gamma parameters
+        sample_size: Total samples to simulate
+        tail_fractions: List or array of tail fractions (e.g., [1e-2, 1e-3, ...])
+
+    Returns:
+        DataFrame: Tail Fraction, Threshold u, and Estimated alpha
+    """
+    if tail_fractions is None:
+        tail_fractions = np.logspace(-5, -2, 10)  # from 1e-5 to 1e-2
+
+    np.random.seed(42)
+    # Simulate data
+    sample_A = np.random.normal(mu_A, sigma_A, sample_size)
+    sample_B = np.random.poisson(lambda_B, sample_size)
+    sample_C = np.random.gamma(k_C, theta_C, sample_size)
+    samples = sample_A + sample_B + sample_C
+    sorted_samples = np.sort(samples)
+
+    results = []
+
+    for tail_fraction in tail_fractions:
+        tail_start_idx = int((1 - tail_fraction) * sample_size)
+        tail_samples = sorted_samples[tail_start_idx:]
+        survival_probs = np.linspace(tail_fraction, 1/sample_size, len(tail_samples))
+        
+        slope, intercept, _, _, _ = linregress(tail_samples, np.log(survival_probs))
+        alpha_estimated = -slope
+        threshold_u = sorted_samples[tail_start_idx]
+        results.append((tail_fraction, threshold_u, alpha_estimated))
+
+    df_alpha = pd.DataFrame(results, columns=["Tail_Fraction", "Threshold_u", "Estimated_alpha"])
+    return df_alpha
+
+# Run alpha sensitivity analysis with tail fraction included
+df_alpha_sensitivity = estimate_alpha_sensitivity_with_fraction(
+    mu_A=0, sigma_A=1,
+    lambda_B=5,
+    k_C=2, theta_C=2,
+    sample_size=int(1e7)
+)
+
+import ace_tools as tools; tools.display_dataframe_to_user(name="Tail Sensitivity: Fraction, Threshold, Alpha", dataframe=df_alpha_sensitivity)
+
+
