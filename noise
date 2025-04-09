@@ -424,4 +424,34 @@ df_alpha_sensitivity = estimate_alpha_sensitivity_with_fraction(
 
 import ace_tools as tools; tools.display_dataframe_to_user(name="Tail Sensitivity: Fraction, Threshold, Alpha", dataframe=df_alpha_sensitivity)
 
+===
+import numpy as np
+import pandas as pd
+import ace_tools as tools
 
+def analytical_snr(k, theta, scale_factor, lambda_B, sigma_A):
+    theta_scaled = scale_factor * theta
+
+    # Pure Gamma
+    extreme_gamma = theta_scaled * np.log(1e6)  # x_q ≈ θ * log(1/q), q=1e-6
+    std_gamma = np.sqrt(k) * theta_scaled
+    snr_gamma = extreme_gamma / std_gamma
+
+    # Combined
+    extreme_combined = theta * np.log(1e6)
+    var_combined = k * theta**2 + lambda_B + sigma_A**2
+    std_combined = np.sqrt(var_combined)
+    snr_combined = extreme_combined / std_combined
+
+    return {
+        "Gamma_Scale_Factor": scale_factor,
+        "SNR_Pure_Analytical": snr_gamma,
+        "SNR_Combined_Analytical": snr_combined
+    }
+
+# Apply for same scale factors used before
+scale_factors = [1, 2, 3, 4, 5, 6, 7]
+analytical_results = [analytical_snr(k=5, theta=3, scale_factor=sf, lambda_B=4, sigma_A=2) for sf in scale_factors]
+
+df_analytical = pd.DataFrame(analytical_results)
+tools.display_dataframe_to_user(name="Analytical SNR Comparison", dataframe=df_analytical)
