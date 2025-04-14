@@ -703,3 +703,176 @@ if __name__ == "__main__":
     
     print("One-step denoised image shape:", x0_pred.shape)
     print("Iteratively refined image shape:", x0_refined.shape)
+
+
+
+
+====
+
+import optuna
+import torch
+import math
+import torch.nn.functional as F
+import torch.nn as nn
+
+# User-configurable variables
+NUM_EPOCHS = 10    # Number of epochs per training run in each trial
+NUM_RUNS = 3       # Number of independent runs per trial (for averaging)
+
+# Dummy implementations of the model components and training/inference functions.
+# Replace these with your actual implementations.
+class V_Prediction_CrossAttn_Model(nn.Module):
+    def __init__(self, in_channels=1, base_channels=64, time_emb_dim=128,
+                 prior_in_channels=3, prior_feature_channels=16, downsample_factor=2, reduction=16):
+        super().__init__()
+        # A simplified architecture for demonstration purposes.
+        self.conv = nn.Conv2d(in_channels + prior_feature_channels, base_channels, kernel_size=3, padding=1)
+        self.out_conv = nn.Conv2d(base_channels, in_channels, kernel_size=3, padding=1)
+    
+    def forward(self, x, t, high_res_prior):
+        # For simplicity, assume high_res_prior is already at the correct size.
+        x_in = torch.cat([x, high_res_prior], dim=1)
+        h = self.conv(x_in)
+        out = self.out_conv(h)
+        return out
+
+class PriorConsistencyNet(nn.Module):
+    def __init__(self, in_channels=1, embed_dim=64):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, embed_dim, kernel_size=3, padding=1)
+    
+    def forward(self, x):
+        return self.conv(x)
+
+def train_one_step_conditional(model, prior_model, dataloader, epochs, image_size,
+                               alpha_bar, mu_range, sigma_range,
+                               lambda_prior, lambda_col, device="cpu"):
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    optimizer_prior = torch.optim.Adam(prior_model.parameters(), lr=1e-4)
+    model.train()
+    prior_model.train()
+    sqrt_alpha_bar = math.sqrt(alpha_bar)
+    sqrt_one_minus_alpha_bar = math.sqrt(1 - alpha_bar)
+    
+    for epoch in range(epochs):
+        for x0, high_res_prior in dataloader:
+            x0 = x0.to(device)
+            high_res_prior = high_res_prior.to(device)
+            batch_size, _, H, W = x0.shape
+            optimizer.zero_grad()
+            optimizer_prior.zero_grad()
+            
+            # Fixed time step t = 1.
+            t = torch.ones(batch_size, device=device, dtype=torch.long)
+            
+            # Generate heterogeneous noise column-wise.
+            mu = torch.rand(batch_size, 1, 1, W, device=device) * (mu_range[1] - mu_range[0]) + mu_range[0]
+            sigma = torch.rand(batch_size, 1, 1, W, device=device) * (sigma_range[1] - sigma_range[0]) + sigma_range[0]
+            noise = mu + sigma * torch.randn(batch_size, 1, H, W, device=device)
+            
+            # Forward process: x1 = sqrt(alpha_bar)*x0 + sqrt(1-alpha_bar)*noise.
+            x1 = sqrt_alpha_bar * x0 + sqrt_one_minus_alpha_bar * noise
+            
+            # Predict noise (or velocity) using the model.
+            predicted_noise = model(x1, t, high_res_prior)
+            
+            # Compute the MSE loss between the predicted and actual noise.
+            loss = F.mse_loss(predicted_noise, noise)
+            loss.backward()
+            optimizer.step()
+            optimizer_prior.step()
+    # Return loss from the final batch (for simplicity).
+    return loss.item()
+
+def denoise_one_step_conditional(model, x1, high_res_prior, alpha_bar, device="cpu"):
+    model.eval()
+    with torch.no_grad():
+        batch_size = x1.size(0)
+        t = torch.ones(batch_size, device=device, dtype=torch.long)
+        predicted_noise = model(x1, t, high_res_prior)
+        sqrt_alpha_bar = math.sqrt(alpha_bar)
+        sqrt_one_minus_alpha_bar = math.sqrt(1 - alpha_bar)
+        x0_pred = sqrt_alpha_bar * x1 - sqrt_one_minus_alpha_bar * predicted_noise
+    return x0_pred
+
+# Objective function that averages over multiple runs per trial.
+def objective(trial):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Suggest hyperparameters.
+    alpha_bar = trial.suggest_float("alpha_bar", 0.8, 0.99)
+    lambda_prior = trial.suggest_float("lambda_prior", 0.001, 0.5)
+    lambda_col = trial.suggest_float("lambda_col", 0.1, 10.0)
+    downsample_factor = trial.suggest_int("downsample_factor", 1, 8)
+    base_channel = trial.suggest_int("base_channel", 16, 128)
+    prior_feature_channels = trial.suggest_int("prior_feature_channels", 8, 64)
+    reduction = trial.suggest_int("reduction", 1, min(32, base_channel))
+    
+    # Fixed parameters for dummy data.
+    image_size = 32
+    batch_size = 8
+    mu_range = (-0.1, 0.1)
+    sigma_range = (0.05, 0.2)
+    
+    # Dummy dataloader: one batch per run.
+    dummy_x0 = torch.randn(batch_size, 1, image_size, image_size)
+    dummy_prior = torch.randn(batch_size, 3, image_size * 4, image_size * 4)
+    dataloader = [(dummy_x0, dummy_prior)]
+    
+    total_val_loss = 0.0
+    
+    for run in range(NUM_RUNS):
+        # Instantiate model and prior consistency module for each run.
+        model = V_Prediction_CrossAttn_Model(
+            in_channels=1,
+            base_channels=base_channel,
+            time_emb_dim=128,
+            prior_in_channels=3,
+            prior_feature_channels=prior_feature_channels,
+            downsample_factor=downsample_factor,
+            reduction=reduction
+        )
+        prior_model = PriorConsistencyNet(in_channels=1, embed_dim=64)
+        model.to(device)
+        prior_model.to(device)
+        
+        # Train model for the specified number of epochs.
+        _ = train_one_step_conditional(
+            model, prior_model, dataloader,
+            epochs=NUM_EPOCHS,
+            image_size=image_size,
+            alpha_bar=alpha_bar,
+            mu_range=mu_range,
+            sigma_range=sigma_range,
+            lambda_prior=lambda_prior,
+            lambda_col=lambda_col,
+            device=device
+        )
+    
+        # After training, simulate the forward process to create a noisy input.
+        sqrt_alpha_bar = math.sqrt(alpha_bar)
+        sqrt_one_minus_alpha_bar = math.sqrt(1 - alpha_bar)
+        H, W = image_size, image_size
+        mu_noise = torch.rand(batch_size, 1, 1, W, device=device) * (mu_range[1] - mu_range[0]) + mu_range[0]
+        sigma_noise = torch.rand(batch_size, 1, 1, W, device=device) * (sigma_range[1] - sigma_range[0]) + sigma_range[0]
+        noise = mu_noise + sigma_noise * torch.randn(batch_size, 1, H, W, device=device)
+        x1 = sqrt_alpha_bar * dummy_x0.to(device) + sqrt_one_minus_alpha_bar * noise
+        
+        # Denoise the image and compute a validation loss.
+        x0_pred = denoise_one_step_conditional(model, x1, dummy_prior.to(device), alpha_bar, device=device)
+        val_loss = F.mse_loss(x0_pred, dummy_x0.to(device))
+        total_val_loss += val_loss.item()
+    
+    average_val_loss = total_val_loss / NUM_RUNS
+    return average_val_loss
+
+if __name__ == "__main__":
+    study = optuna.create_study(direction="minimize")
+    study.optimize(objective, n_trials=20)  # Increase n_trials as needed
+    
+    print("Best trial:")
+    best_trial = study.best_trial
+    print("  Average Validation Loss: {:.6f}".format(best_trial.value))
+    print("  Hyperparameters:")
+    for key, value in best_trial.params.items():
+        print("    {}: {}".format(key, value))
