@@ -388,3 +388,98 @@ def iterative_denoise_conditional(model, x1, high_res_prior, iterations=3, devic
         x_iter = denoise_one_step_conditional(model, x_iter, high_res_prior, device=device)
     return x_iter
 
+
+###############################################
+# Bayssian Optimization with Optuna
+###############################################
+import optuna
+import torch
+import math
+import torch.nn.functional as F
+import torch.nn as nn
+
+# User-configurable variables
+NUM_EPOCHS = 10    # Number of epochs per training run per trial
+NUM_RUNS = 3       # Number of runs per trial
+
+# Objective function that averages over runs per trial.
+def objective(trial):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Suggest hyperparameters.
+    alpha_bar = trial.suggest_float("alpha_bar", 0.8, 0.99)
+    lambda_prior = trial.suggest_float("lambda_prior", 0.001, 0.5)
+    lambda_col = trial.suggest_float("lambda_col", 0.1, 10.0)
+    downsample_factor = 2   # Fixed.
+    base_channel = trial.suggest_int("base_channel", 16, 128)
+    prior_feature_channels = trial.suggest_int("prior_feature_channels", 8, 64)
+    reduction = trial.suggest_int("reduction", 1, min(32, base_channel))
+    num_levels = trial.suggest_int("num_levels", 1, 5)
+    kernel_size = trial.suggest_int("kernel_size", 3, 7, step=2)
+    
+    image_size = 32
+    batch_size = 8
+    mu_range = (-0.1, 0.1)
+    sigma_range = (0.05, 0.2)
+    
+    # Define configurable channel numbers
+    in_channels = 2    # configurable low-res channels
+    prior_in_channels = 3  # configurable high-res prior channels
+    
+    # Generate dummy inputs using the variable channels
+    dummy_x0 = torch.randn(batch_size, in_channels, image_size, image_size)
+    dummy_prior = torch.randn(batch_size, prior_in_channels, image_size * 4, image_size * 4)
+    dataloader = [(dummy_x0, dummy_prior)]
+    
+    total_val_loss = 0.0
+    
+    for run in range(NUM_RUNS):
+        model = V_Prediction_CrossAttn_Model(in_channels=in_channels, base_channels=base_channel, time_emb_dim=128,
+            prior_in_channels=prior_in_channels, prior_feature_channels=prior_feature_channels,
+            downsample_factor=downsample_factor, reduction=reduction,
+            num_prior_levels=num_levels, kernel_size=kernel_size
+        )
+        model.resblock1 = ResidualBlockWithCrossAttention(
+            base_channel, base_channel, 128, reduction
+        )
+        model.to(device)
+        
+        _ = train_one_step_conditional(
+            model,
+            dataloader,
+            epochs=NUM_EPOCHS,
+            image_size=image_size,
+            alpha_bar=alpha_bar,
+            mu_range=mu_range,
+            sigma_range=sigma_range,
+            lambda_prior=lambda_prior,
+            lambda_col=lambda_col,
+            device=device
+        )
+    
+        sqrt_alpha_bar = math.sqrt(alpha_bar)
+        sqrt_one_minus_alpha_bar = math.sqrt(1 - alpha_bar)
+        H, W = image_size, image_size
+        mu_noise = torch.rand(batch_size, 1, 1, W, device=device) * (mu_range[1]-mu_range[0]) + mu_range[0]
+        sigma_noise = torch.rand(batch_size, 1, 1, W, device=device) * (sigma_range[1]-sigma_range[0]) + sigma_range[0]
+        noise = mu_noise + sigma_noise * torch.randn(batch_size, in_channels, H, W, device=device)
+        x1 = sqrt_alpha_bar * dummy_x0.to(device) + sqrt_one_minus_alpha_bar * noise
+        
+        x0_pred = denoise_one_step_conditional(model, x1, dummy_prior.to(device), device=device)
+        val_loss = F.mse_loss(x0_pred, dummy_x0.to(device))
+        total_val_loss += val_loss.item()
+    
+    average_val_loss = total_val_loss / NUM_RUNS
+    return average_val_loss
+
+if __name__ == "__main__":
+    study = optuna.create_study(direction="minimize")
+    study.optimize(objective, n_trials=20)
+    
+    print("Best trial:")
+    best_trial = study.best_trial
+    print("  Average Validation Loss: {:.6f}".format(best_trial.value))
+    print("  Hyperparameters:")
+    for key, value in best_trial.params.items():
+        print("    {}: {}".format(key, value))
+
