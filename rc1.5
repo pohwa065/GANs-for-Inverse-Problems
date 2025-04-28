@@ -483,3 +483,193 @@ if __name__ == "__main__":
     for key, value in best_trial.params.items():
         print("    {}: {}".format(key, value))
 
+
+rev..
+
+
+#############################################
+# Simple Un-conditional Velocity Predictor
+#############################################
+class VelocityUNet(nn.Module):
+    """
+    Very small UNet-style backbone that predicts the velocity
+    v = sqrt(alpha_bar) * noise – sqrt(1-alpha_bar) * x0
+    from the noisy image alone (no prior features).
+    """
+    def __init__(self, in_ch=2, base_ch=64, time_dim=128):
+        super().__init__()
+        self.time_proj = nn.Linear(time_dim, time_dim)
+
+        self.down1 = nn.Conv2d(in_ch,     base_ch, 3, padding=1)
+        self.down2 = nn.Conv2d(base_ch,   base_ch*2, 3, stride=2, padding=1)
+        self.up1   = nn.ConvTranspose2d(base_ch*2, base_ch, 4, stride=2, padding=1)
+
+        self.res = ResidualBlockWithCrossAttention(
+            base_ch*2, base_ch, time_dim, reduction=16, cond_channels=base_ch
+        )
+        self.head = nn.Conv2d(base_ch, in_ch, 3, padding=1)
+        self.act  = nn.ReLU(inplace=True)
+
+    def forward(self, x, t):
+        t_emb = get_timestep_embedding(t, self.time_proj.in_features)
+        t_emb = self.time_proj(t_emb)
+
+        d1 = self.act(self.down1(x))           # (B, C, H, W)
+        d2 = self.act(self.down2(d1))          # (B, 2C, H/2, W/2)
+        u1 = self.act(self.up1(d2))            # (B, C, H, W)
+
+        h  = torch.cat([d1, u1], dim=1)        # skip-connection concat
+        h  = self.res(h, t_emb, cond=None)     # ← no prior conditioning
+        return self.head(h)
+
+#############################################
+# Discriminator (Patch-GAN)
+#############################################
+class PatchDiscriminator(nn.Module):
+    def __init__(self, in_ch=2, base=64):
+        super().__init__()
+        def blk(cin, cout, s):
+            return nn.Sequential(
+                nn.Conv2d(cin, cout, 4, stride=s, padding=1),
+                nn.LeakyReLU(0.2, True)
+            )
+        self.net = nn.Sequential(
+            blk(in_ch,     base,   2),
+            blk(base,      base*2, 2),
+            blk(base*2,    base*4, 2),
+            nn.Conv2d(base*4, 1, 4, padding=1)  # logits
+        )
+    def forward(self, x):
+        return self.net(x)
+
+
+#############################################
+# VGG perceptual helper  (conv1_2 + conv2_2)
+#############################################
+from torchvision.models import vgg16
+_vgg_feat = vgg16(weights="DEFAULT").features.eval()
+for p in _vgg_feat.parameters(): p.requires_grad = False
+def perceptual_L1(x, y):
+    # expects 3-channel RGB in 0..1; convert if grey-scale
+    if x.shape[1] == 1:
+        x = x.repeat(1,3,1,1)
+        y = y.repeat(1,3,1,1)
+    feats = []
+    curx, cury = x, y
+    for i, layer in _vgg_feat._modules.items():
+        curx = layer(curx); cury = layer(cury)
+        if i in {"3", "8"}:   # relu1_2, relu2_2
+            feats.append(F.l1_loss(curx, cury))
+        if i == "8": break
+    return sum(feats)
+
+
+#############################################
+# Laplacian consistency  (|Δx0_pred – Δx0|)
+#############################################
+_lap_kernel = torch.tensor([[0,  1, 0],
+                            [1, -4, 1],
+                            [0,  1, 0]], dtype=torch.float32).view(1,1,3,3)
+def laplacian(img):
+    k = _lap_kernel.to(img.device)
+    ch = img.shape[1]
+    k = k.repeat(ch,1,1,1)
+    return F.conv2d(img, k, padding=1, groups=ch)
+
+
+def train_one_step(model, D, dataloader,
+                   epochs, alpha_bar,
+                   λ_col, λ_prior, λ_perc, λ_gan, λ_lap,
+                   device):
+
+    G_opt = torch.optim.Adam(model.parameters(), lr=2e-4, betas=(0.5,0.999))
+    D_opt = torch.optim.Adam(D.parameters(),     lr=2e-4, betas=(0.5,0.999))
+
+    sqrt_ab   = math.sqrt(alpha_bar)
+    sqrt_1ab  = math.sqrt(1-alpha_bar)
+
+    model.train();  D.train()
+
+    for ep in range(epochs):
+        for x0, prior_hr in dataloader:
+
+            x0 = x0.to(device); prior_hr = prior_hr.to(device)
+            B,_,H,W = x0.shape
+            t = torch.ones(B, device=device, dtype=torch.long)
+
+            # --- corrupt ----------------------------------------------------
+            mu    = torch.rand(B,1,1,W, device=device)*0.2-0.1
+            sigma = torch.rand(B,1,1,W, device=device)*0.15+0.05
+            noise = mu + sigma*torch.randn_like(x0)
+            x1    = sqrt_ab*x0 + sqrt_1ab*noise
+
+            # === Train Discriminator ========================================
+            with torch.no_grad():
+                v_pred = model(x1, t)                 # velocity
+                x0_hat = sqrt_ab*x1 - sqrt_1ab*v_pred
+            D_real = D(x0)        ; D_fake = D(x0_hat)
+
+            loss_D = (F.relu(1.-D_real).mean() +
+                      F.relu(1.+D_fake).mean())
+
+            D_opt.zero_grad();  loss_D.backward();  D_opt.step()
+
+            # === Train Generator (denoiser) =================================
+            v_pred = model(x1, t)
+            x0_hat = sqrt_ab*x1 - sqrt_1ab*v_pred
+
+            #   core losses
+            v_true   = sqrt_ab*noise - sqrt_1ab*x0
+            loss_mse = F.mse_loss(v_pred, v_true)
+            loss_col = F.mse_loss(v_pred, v_pred.mean(2,keepdim=True))
+
+            #   prior consistency (down-sample prior only in loss)
+            prior_ds = F.interpolate(prior_hr, size=(H,W), mode="bilinear", align_corners=False)
+            loss_prior = shifted_mse_loss(x0_hat, prior_ds)
+
+            #   perceptual & laplacian
+            loss_perc = perceptual_L1(x0_hat.clamp(0,1), x0.clamp(0,1))
+            loss_lap  = F.l1_loss(laplacian(x0_hat), laplacian(x0))
+
+            #   GAN hinge for G
+            loss_gan = -D(x0_hat).mean()
+
+            loss_G = (loss_mse
+                      + λ_col*loss_col
+                      + λ_prior*loss_prior
+                      + λ_perc*loss_perc
+                      + λ_lap*loss_lap
+                      + λ_gan*loss_gan)
+
+            G_opt.zero_grad(); loss_G.backward(); G_opt.step()
+
+
+
+def objective(trial):
+    # --- search ranges ------------------------------------------------------
+    alpha_bar     = trial.suggest_float("alpha_bar", 0.8, 0.99)
+    λ_col         = trial.suggest_loguniform("lambda_col",   1e-2, 10.0)
+    λ_prior       = trial.suggest_loguniform("lambda_prior", 1e-3, 1.0)
+    λ_perc        = trial.suggest_loguniform("lambda_perc",  1e-3, 1.0)
+    λ_gan         = trial.suggest_loguniform("lambda_gan",   1e-4, 1e-1)
+    λ_lap         = trial.suggest_loguniform("lambda_lap",   1e-3, 1.0)
+
+    base_ch       = trial.suggest_int("base_channel", 32, 128)
+
+    # build tiny dummy dataloader  (replace with real data)
+    ...
+
+    val_accum = 0.
+    for _ in range(NUM_RUNS):
+        G = VelocityUNet(in_ch=2, base_ch=base_ch).to(device)
+        D = PatchDiscriminator(in_ch=2).to(device)
+
+        train_one_step(G, D, dataloader,
+                       epochs=NUM_EPOCHS,
+                       alpha_bar=alpha_bar,
+                       λ_col=λ_col, λ_prior=λ_prior,
+                       λ_perc=λ_perc, λ_gan=λ_gan, λ_lap=λ_lap,
+                       device=device)
+
+        # quick validation on dummy batch
+        ...
