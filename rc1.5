@@ -94,22 +94,22 @@ class ResidualBlockWithCrossAttention(nn.Module):
         self.cond_proj = nn.Conv2d(cond_channels, out_channels, kernel_size=1) if cond_channels != out_channels else None
 
     def forward(self, x, t_emb, cond=None):
-        print("x.shape", x.shape)  # Shape: (n, in_channels, H, W)
+        #print("x.shape", x.shape)  # Shape: (n, in_channels, H, W)
         h = self.activation(self.conv1(x))
-        print("h.shape", h.shape)
+        #print("h.shape", h.shape)
         # Project time embedding to match the feature channels.
         t_emb_proj = self.time_emb_proj(t_emb).unsqueeze(-1).unsqueeze(-1)
         h = h + t_emb_proj
-        print("h.shape", h.shape)  # Shape: (n, out_channels, H, W)
+        #print("h.shape", h.shape)  # Shape: (n, out_channels, H, W)
         h = self.conv2(h)
-        print("h.shape", h.shape)  # Shape: (n, out_channels, H, W)
+        #print("h.shape", h.shape)  # Shape: (n, out_channels, H, W)
         h = self.channel_attention(h)
-        print("h.shape", h.shape)  # Shape: (n, out_channels, H, W)
+        #print("h.shape", h.shape)  # Shape: (n, out_channels, H, W)
         if cond is not None:
-            print("cond.shape", cond.shape) ## Shape: (n, cond_channels, H, W)
+            #print("cond.shape", cond.shape) ## Shape: (n, cond_channels, H, W)
             if self.cond_proj is not None:   #4/13
                 cond = self.cond_proj(cond)  #4/13
-                print("cond.shape", cond.shape)
+                #print("cond.shape", cond.shape)
             h = self.cross_attention(h, cond)  #cond = prior_features
         if self.skip_conv is not None:
             x = self.skip_conv(x)
@@ -265,11 +265,11 @@ def generate_prior_ds(prior_hr, x0_hat, device="cuda"):
                 weight[idx, 0, i, j] = 1.0
     
     # Convolve prior_odd with weight using groups=c_odd
-    print("prior_odd.shape", prior_odd.shape)  # Shape: (N, c_odd, H, W)
-    print("weight.shape", weight.shape)        # Shape: (c_odd * kernel_h * kernel_w, 1, kernel_h, kernel_w)
+    #print("prior_odd.shape", prior_odd.shape)  # Shape: (N, c_odd, H, W)
+    #print("weight.shape", weight.shape)        # Shape: (c_odd * kernel_h * kernel_w, 1, kernel_h, kernel_w)
     
     prior_ds = F.conv2d(prior_odd, weight, bias=None, stride=(kernel_h, kernel_w), groups=c_odd)
-    print("prior_ds.shape", prior_ds.shape)  # Shape: (N, c_odd * kernel_h * kernel_w, 1, kernel_h, kernel_w, h, w)
+    #print("prior_ds.shape", prior_ds.shape)  # Shape: (N, c_odd * kernel_h * kernel_w, 1, kernel_h, kernel_w, h, w)
     return prior_ds
 
 #############################################
@@ -321,57 +321,50 @@ def shifted_mse_loss(image1, image2):
 def train_one_step(model, D, dataloader,
                    epochs, image_size, alpha_bar, mu_range, sigma_range,
                    λ_col, λ_prior, λ_perc, λ_gan, λ_lap,
-                   device):
-
+                   device, val_dataloader=None):
     G_opt = torch.optim.Adam(model.parameters(), lr=2e-4, betas=(0.5,0.999))
     D_opt = torch.optim.Adam(D.parameters(),     lr=2e-4, betas=(0.5,0.999))
 
     sqrt_ab   = math.sqrt(alpha_bar)
     sqrt_1ab  = math.sqrt(1-alpha_bar)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     model.train();  D.train()
 
     for epoch in range(epochs):
+        # --- Training Loop -------------------------------------------
         for x0, prior_hr in dataloader:
-            x0 = x0.to(device); prior_hr = prior_hr.to(device)
+            x0 = x0.to(device);  prior_hr = prior_hr.to(device)
             batch_size,_,H,W = x0.shape
-            optimizer.zero_grad()
-            
             t = torch.ones(batch_size, device=device, dtype=torch.long)
+            mu = torch.rand(batch_size, 1, 1, W, device=device) * (mu_range[1]-mu_range[0]) + mu_range[0]
 
-            # --- corrupt ----------------------------------------------------
-            mu = torch.rand(batch_size, 1, 1, W, device=device) * (mu_range[1] - mu_range[0]) + mu_range[0]
-            sigma = torch.rand(batch_size, 1, 1, W, device=device) * (sigma_range[1] - sigma_range[0]) + sigma_range[0]
-            noise = mu + sigma * torch.randn(batch_size, x0.size(1), H, W, device=device)
+            # multimodel noise
+            p_low = 0.5        # probability of low sigma mode
+            mode_selector = torch.rand(batch_size, 1, 1, 1, device=device)
+            sigma_low = sigma_range[0] * torch.randn(batch_size, 1, 1, W, device=device)
+            sigma_high = sigma_range[1] * torch.randn(batch_size, 1, 1, W, device=device)
+            sigma_mode = torch.where(mode_selector < p_low, sigma_low, sigma_high)
 
-            # Forward process: x1 = sqrt(alpha_bar)*x0 + sqrt(1-alpha_bar)*noise.
-            x1    = sqrt_ab*x0 + sqrt_1ab*noise
-
-            # === Train Discriminator ========================================
+            #sigma = torch.rand(batch_size, 1, 1, W, device=device) * (sigma_range[1]-sigma_range[0]) + sigma_range[0]
+            noise = mu + sigma_mode * torch.randn(batch_size, x0.size(1), H, W, device=device)
+            x1 = sqrt_ab * x0 + sqrt_1ab * noise
+            
+            # normalize x1 to [0,1] range
+            x1 = (x1 - x1.min()) / (x1.max() - x1.min())
+            
             with torch.no_grad():
-                v_pred = model(x1, t)                 # velocity
-                x0_hat = sqrt_ab*x1 - sqrt_1ab*v_pred
-            D_real = D(x0)        ; D_fake = D(x0_hat)
-
-            loss_D = (F.relu(1.-D_real).mean() +
-                      F.relu(1.+D_fake).mean())
-
+                v_pred = model(x1, t)
+                x0_hat = sqrt_ab * x1 - sqrt_1ab * v_pred
+            D_real = D(x0);  D_fake = D(x0_hat)
+            loss_D = (F.relu(1.-D_real).mean() + F.relu(1.+D_fake).mean())
             D_opt.zero_grad();  loss_D.backward();  D_opt.step()
-
-            # === Train Generator (denoiser) =================================
+            
             v_pred = model(x1, t)
-            x0_hat = sqrt_ab*x1 - sqrt_1ab*v_pred
-
-            #   core losses
-            v_true   = sqrt_ab*noise - sqrt_1ab*x0
+            x0_hat = sqrt_ab * x0 + (- sqrt_1ab) * v_pred  # ...existing inversion...
+            v_true   = sqrt_ab * noise - sqrt_1ab * x0
             loss_mse = F.mse_loss(v_pred, v_true)
-            loss_col = F.mse_loss(v_pred, v_pred.mean(2,keepdim=True))
-
-            #   prior consistency (down-sample prior only in loss)
+            loss_col = F.mse_loss(v_pred, v_pred.mean(2, keepdim=True))
             prior_ds = generate_prior_ds(prior_hr, x0_hat, device=device)
-            loss_prior = shifted_mse_loss(x0_hat, prior_ds)      #W1 vs. prior_ds from W1
-
-            #   GAN hinge for G
+            loss_prior = shifted_mse_loss(x0_hat, prior_ds)
             loss_gan = -D(x0_hat).mean()
 
             #   perceptual & laplacian of x0_hat and x0 using 1st channel only
@@ -379,101 +372,53 @@ def train_one_step(model, D, dataloader,
             x0_1     = x0[:, 0:1, :, :]
             loss_perc = perceptual_L1(x0_hat_1.clamp(0,1), x0_1.clamp(0,1))
             loss_lap  = F.l1_loss(laplacian(x0_hat_1), laplacian(x0_1))
-
-
             loss_G = (loss_mse
                       + λ_col*loss_col
                       + λ_prior*loss_prior
                       + λ_perc*loss_perc
                       + λ_lap*loss_lap
                       + λ_gan*loss_gan)
-
+            
             G_opt.zero_grad(); loss_G.backward(); G_opt.step()
-        print(f"Epoch {epoch+1}/{epochs} - Total Loss: {loss_G.item():.6f} | MSE: {loss_mse.item():.6f} | Col: {loss_col.item():.6f} | Prior: {loss_prior.item():.6f} | Perc: {loss_perc.item():.6f} | Lap: {loss_lap.item():.6f} | GAN: {loss_gan.item():.6f}")
-
-
-'''
-def train_one_step_conditional(model, dataloader, epochs=10, image_size=32,
-                               alpha_bar=0.9, mu_range=(-0.1, 0.1), sigma_range=(0.05, 0.2),
-                               lambda_prior=0.1, lambda_col=1.0, device="cuda"):
-    """
-    Train the conditional one-step denoiser.
-    
-    For each clean image x0 (shape: [batch, 2, image_size, image_size]) and its corresponding high-res prior,
-    the forward process is:
-         x1 = sqrt(alpha_bar)*x0 + sqrt(1-alpha_bar)*noise,
-    where noise is sampled heterogeneously per column:
-         For each column, sample a mean and sigma from the given ranges,
-         then for every pixel in that column, noise ~ N(mu, sigma^2).
-    
-    Loss terms:
-      - Velocity prediction loss: MSE between predicted noise and actual noise.
-      - Column consistency loss: Enforce that predicted noise is constant along rows for each column.
-      - Prior consistency loss: MSE between the denoised image (computed from the model’s inversion) and the downsampled prior.
-    
-    
-    # the forward process (note 4/23)
-    x1 = sqrt(alpha_bar)*x0 + sqrt(1-alpha_bar)*noise,
-    
-    model output is predicted_noise = velocity = sqrt(alpha_bar)*noise - sqrt(1-alpha_bar)*x0.
-    
-    predicted_x0 = sqrt(alpha_bar)*x1 - sqrt(1-alpha_bar)*predicted_noise.
-    
-    see proof in the Note
-    
-    """
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-    model.train()
-    sqrt_alpha_bar = math.sqrt(alpha_bar)
-    sqrt_one_minus_alpha_bar = math.sqrt(1 - alpha_bar)
-    
-    for epoch in range(epochs):
-        for x0, high_res_prior in dataloader:
-            # x0: clean low-res image (batch, 2, image_size, image_size)
-            # high_res_prior: high-res prior image (batch, 3, H_prior, W_prior)
-            x0 = x0.to(device)
-            high_res_prior = high_res_prior.to(device)
-            batch_size, _, H, W = x0.shape
-            optimizer.zero_grad()
-            
-            # Fixed t = 1 for one-step denoising.
-            t = torch.ones(batch_size, device=device, dtype=torch.long)
-            
-            # Generate heterogeneous noise column-wise.
-            mu = torch.rand(batch_size, 1, 1, W, device=device) * (mu_range[1] - mu_range[0]) + mu_range[0]
-            sigma = torch.rand(batch_size, 1, 1, W, device=device) * (sigma_range[1] - sigma_range[0]) + sigma_range[0]
-            noise = mu + sigma * torch.randn(batch_size, 2, H, W, device=device)
-            
-            # Forward process: x1 = sqrt(alpha_bar)*x0 + sqrt(1-alpha_bar)*noise.
-            x1 = sqrt_alpha_bar * x0 + sqrt_one_minus_alpha_bar * noise
-            
-            # Predict velocity (v) using the model. model output is velocity = sqrt(alpha_bar)*noise - sqrt(1-alpha_bar)*x0.
-            predicted_noise = model(x1, t, high_res_prior)
-            
-            # Loss 1: MSE between predicted noise and actual noise.
-            v_true = math.sqrt(alpha_bar) * noise - math.sqrt(1 - alpha_bar) * x0
-            loss_mse = F.mse_loss(predicted_noise, v_true)  #4/23
-            
-            # Loss 2: Column consistency loss.
-            # For each column, compute the mean across rows and enforce predicted noise is close to that mean.
-            pred_col_mean = predicted_noise.mean(dim=2, keepdim=True)
-            loss_col = F.mse_loss(predicted_noise, pred_col_mean)
-            
-            # (For our one-step setting, note that predicting noise or velocity are equivalent up to scaling.)
-            # Inversion: Estimate the clean image: x0_pred = sqrt(alpha_bar)*x1 - sqrt(1-alpha_bar)*predicted_noise.
-            x0_pred = sqrt_alpha_bar * x1 - sqrt_one_minus_alpha_bar * predicted_noise
-            
-            # Loss 3: Prior consistency loss.
-            # Downsample high_res_prior to match x0 size.
-            prior_down = F.interpolate(high_res_prior, size=x0.shape[-2:], mode='bilinear', align_corners=False)
-            
-            loss_prior = shifted_mse_loss(x0_pred, prior_down)    #4/16 
-            
-            total_loss = loss_mse + lambda_col * loss_col + lambda_prior * loss_prior
-            total_loss.backward()
-            optimizer.step()
-        print(f"Epoch {epoch+1}/{epochs} - Total Loss: {total_loss.item():.6f} | MSE: {loss_mse.item():.6f} | Col: {loss_col.item():.6f} | Prior: {loss_prior.item():.6f}")
-'''
+        
+        # --- Validation Loop (if provided) -------------------------
+        if val_dataloader is not None:
+            model.eval()
+            val_losses = []
+            with torch.no_grad():
+                for x0, prior_hr in val_dataloader:
+                    x0 = x0.to(device);  prior_hr = prior_hr.to(device)
+                    batch_size, _, H, W = x0.shape
+                    t = torch.ones(batch_size, device=device, dtype=torch.long)
+                    mu = torch.rand(batch_size, 1, 1, W, device=device) * (mu_range[1] - mu_range[0]) + mu_range[0]
+                    # new noise generation code start for validation
+                    p_low = 0.5        # probability of low sigma mode
+                    mode_selector = torch.rand(batch_size, 1, 1, 1, device=device)
+                    sigma_low = sigma_range[0] * torch.randn(batch_size, 1, 1, W, device=device)
+                    sigma_high = sigma_range[1] * torch.randn(batch_size, 1, 1, W, device=device)
+                    sigma_mode = torch.where(mode_selector < p_low, sigma_low, sigma_high)
+                    noise = mu + sigma_mode * torch.randn(batch_size, x0.size(1), H, W, device=device)
+                    x1 = sqrt_ab * x0 + sqrt_1ab * noise
+                    # new noise generation code end for validation
+                    v_pred = model(x1, t)
+                    x0_hat = sqrt_ab * x1 - sqrt_1ab * v_pred
+                    v_true = sqrt_ab * noise - sqrt_1ab * x0
+                    loss_mse = F.mse_loss(v_pred, v_true)
+                    loss_col = F.mse_loss(v_pred, v_pred.mean(2, keepdim=True))
+                    prior_ds = generate_prior_ds(prior_hr, x0_hat, device=device)
+                    loss_prior = shifted_mse_loss(x0_hat, prior_ds)
+                    loss_gan = -D(x0_hat).mean()
+                    x0_hat_1 = x0_hat[:, 0:1, :, :]
+                    x0_1     = x0[:, 0:1, :, :]
+                    loss_perc = perceptual_L1(x0_hat_1.clamp(0,1), x0_1.clamp(0,1))
+                    loss_lap = F.l1_loss(laplacian(x0_hat_1), laplacian(x0_1))
+                    loss_G_val = (loss_mse + λ_col*loss_col + λ_prior*loss_prior + λ_perc*loss_perc + λ_lap*loss_lap + λ_gan*loss_gan)
+                    val_losses.append(loss_G_val.item())
+            avg_val_loss = sum(val_losses)/len(val_losses) if val_losses else 0.0
+            print(f"Epoch {epoch+1}/{epochs} - Training Loss: {loss_G.item():.6f} | Validation Loss: {avg_val_loss:.6f}")
+            model.train()
+        else:
+            print(f"Epoch {epoch+1}/{epochs} - Training Loss: {loss_G.item():.6f}")
 
 #############################################
 # Inference Pipeline: One-Step Conditional Denoising
