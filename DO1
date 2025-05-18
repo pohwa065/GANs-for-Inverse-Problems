@@ -1,0 +1,403 @@
+import torch
+import torch.nn as nn
+import torch.fft
+import numpy as np
+import math
+
+# --- Utility and Helper Functions ---
+
+def create_grid(H, W, dx_m, device='cpu'):
+    """
+    Creates spatial and frequency grids.
+
+    Args:
+        H (int): Height of the grid.
+        W (int): Width of the grid.
+        dx_m (float or tuple): Pixel pitch in meters (dy_m, dx_m). If float, assumes square pixels.
+        device (str): PyTorch device.
+
+    Returns:
+        x_coords (torch.Tensor): X coordinates (m).
+        y_coords (torch.Tensor): Y coordinates (m).
+        fx_coords (torch.Tensor): X spatial frequencies (1/m).
+        fy_coords (torch.Tensor): Y spatial frequencies (1/m).
+    """
+    if isinstance(dx_m, float):
+        dy_m = dx_m
+    else:
+        dy_m, dx_m = dx_m
+
+    x = torch.arange(-W // 2, W // 2, device=device) * dx_m
+    y = torch.arange(-H // 2, H // 2, device=device) * dy_m
+    y_coords, x_coords = torch.meshgrid(y, x, indexing='ij')
+
+    # Frequency coordinates
+    # PyTorch's fftfreq gives frequencies in cycles/sample. Multiply by 1/dx to get cycles/meter.
+    fx_cycles_sample = torch.fft.fftfreq(W, d=1.0, device=device) # Cycles/sample
+    fy_cycles_sample = torch.fft.fftfreq(H, d=1.0, device=device) # Cycles/sample
+
+    # Shift to be compatible with ifftshift if needed for visualization or specific FFT algos
+    # For direct use with torch.fft, unshifted is often fine.
+    # fx_cycles_sample = torch.fft.fftshift(fx_cycles_sample)
+    # fy_cycles_sample = torch.fft.fftshift(fy_cycles_sample)
+
+    fx_coords = fx_cycles_sample / dx_m # Cycles/meter (1/m)
+    fy_coords = fy_cycles_sample / dy_m # Cycles/meter (1/m)
+
+    # Create meshgrids for frequency coordinates
+    # Note: fft operations in PyTorch handle frequency ordering internally.
+    # We typically need meshgrid versions if we are constructing filters directly in freq domain.
+    fy_coords_mesh, fx_coords_mesh = torch.meshgrid(fy_cycles_sample, fx_cycles_sample, indexing='ij')
+    fy_coords_phys_mesh = fy_coords_mesh / dy_m
+    fx_coords_phys_mesh = fx_coords_mesh / dx_m
+
+
+    return x_coords, y_coords, fx_coords_phys_mesh, fy_coords_phys_mesh
+
+
+def generate_zernike_basis(num_coeffs, H, W, radius_pix, device='cpu'):
+    """
+    Generates a basis of Zernike polynomials on a Cartesian grid.
+    This is a simplified placeholder. A robust implementation would use
+    standard Zernike generation formulas (e.g., using OSA/ANSI indexing).
+
+    Args:
+        num_coeffs (int): Number of Zernike polynomials (e.g., Noll's j).
+        H (int): Height of the grid.
+        W (int): Width of the grid.
+        radius_pix (float): Radius of the circular domain in pixels.
+        device (str): PyTorch device.
+
+    Returns:
+        torch.Tensor: A tensor of shape (H, W, num_coeffs) containing Zernike basis.
+    """
+    print(f"Generating a placeholder Zernike basis of {num_coeffs} polynomials...")
+    zernike_basis = torch.zeros((H, W, num_coeffs), device=device)
+    y = torch.linspace(-1, 1, H, device=device)
+    x = torch.linspace(-1, 1, W, device=device)
+    yy, xx = torch.meshgrid(y, x, indexing='ij')
+    rho = torch.sqrt(xx**2 + yy**2)
+    phi = torch.atan2(yy, xx)
+
+    # Mask for circular domain
+    mask = (rho <= 1.0)
+
+    # Example: Fill with some simple Zernike-like terms for placeholder
+    # Piston (j=1)
+    if num_coeffs > 0:
+        zernike_basis[..., 0] = mask * 1.0
+    # Tip (j=2)
+    if num_coeffs > 1:
+        zernike_basis[..., 1] = mask * 2.0 * rho * torch.cos(phi) # x
+    # Tilt (j=3)
+    if num_coeffs > 2:
+        zernike_basis[..., 2] = mask * 2.0 * rho * torch.sin(phi) # y
+    # Defocus (j=4)
+    if num_coeffs > 3:
+        zernike_basis[..., 3] = mask * torch.sqrt(torch.tensor(3.0, device=device)) * (2 * rho**2 - 1)
+    # Astigmatism (0 deg) (j=5)
+    if num_coeffs > 4:
+        zernike_basis[..., 4] = mask * torch.sqrt(torch.tensor(6.0, device=device)) * rho**2 * torch.cos(2*phi)
+
+    # For other coefficients, fill with zeros or more complex terms
+    for j in range(5, num_coeffs):
+         # Simple random-ish pattern for higher orders as placeholder
+        zernike_basis[..., j] = mask * rho**(j//2) * torch.cos((j%3+1)*phi) * torch.randn(1, device=device)
+
+
+    # Normalize (optional, but good practice for stability)
+    # for j in range(num_coeffs):
+    #     norm_val = torch.sqrt(torch.sum(zernike_basis[..., j]**2 * (rho <= 1.0)))
+    #     if norm_val > 1e-6:
+    #         zernike_basis[..., j] /= norm_val
+    print("Placeholder Zernike basis generated.")
+    return zernike_basis
+
+
+def phase_from_zernike_coeffs(zernike_coeffs, zernike_basis):
+    """
+    Computes the phase profile from Zernike coefficients and basis.
+
+    Args:
+        zernike_coeffs (torch.Tensor): 1D tensor of Zernike coefficients [num_coeffs].
+        zernike_basis (torch.Tensor): 3D tensor of Zernike basis [H, W, num_coeffs].
+
+    Returns:
+        torch.Tensor: 2D phase profile [H, W].
+    """
+    # Einsum for: sum_j (coeffs_j * basis_HWj) -> phase_HW
+    phase_profile_opd = torch.einsum('j,hwj->hw', zernike_coeffs, zernike_basis)
+    return phase_profile_opd
+
+
+def propagate_fresnel_pytorch(input_field_nchw, dx_m, dist_m, wavelength_m):
+    """
+    Fresnel propagation using the single Fourier transform (convolutional) method.
+    Matches the logic from the TensorFlow version.
+
+    Args:
+        input_field_nchw (torch.Tensor): Input complex E-field (N, C, H, W). Assumes C=1.
+        dx_m (float or tuple): Pixel pitch at input plane (m). (dy, dx) or single value for square.
+        dist_m (float): Propagation distance (m).
+        wavelength_m (float): Wavelength of light (m).
+
+    Returns:
+        torch.Tensor: Output complex E-field at sensor plane (N, C, H, W).
+    """
+    N, C, H, W = input_field_nchw.shape
+    device = input_field_nchw.device
+
+    if C != 1:
+        raise ValueError("propagate_fresnel_pytorch expects input_field_nchw with C=1")
+
+    input_field = input_field_nchw.squeeze(1) # Shape (N, H, W)
+
+    if isinstance(dx_m, float):
+        dy_m_in = dx_m
+        dx_m_in = dx_m
+    else:
+        dy_m_in, dx_m_in = dx_m
+
+    # Spatial coordinates at input plane
+    x_coords_in, y_coords_in, fx_coords_prop, fy_coords_prop = create_grid(H, W, (dy_m_in, dx_m_in), device=device)
+    # fx_coords_prop, fy_coords_prop are the frequency coordinates for the propagator H
+
+    # 1. Quadratic phase factor for input field
+    # exp(j * pi / (lambda * z) * (x^2 + y^2))
+    quad_phase_factor_in = torch.exp(
+        1j * torch.pi / (wavelength_m * dist_m) * (x_coords_in**2 + y_coords_in**2)
+    )
+    # Add batch dimension for broadcasting: [1, H, W]
+    quad_phase_factor_in = quad_phase_factor_in.unsqueeze(0)
+
+    U_prime = input_field * quad_phase_factor_in # (N, H, W)
+
+    # 2. FFT of the modified input field
+    G = torch.fft.fft2(U_prime, norm='ortho') # (N, H, W)
+
+    # 3. Fresnel propagator transfer function in frequency domain
+    # H_freq = exp(j * pi * lambda * z * (u^2 + v^2))
+    # u, v are spatial frequencies
+    propagator_freq = torch.exp(
+        1j * torch.pi * wavelength_m * dist_m * (fx_coords_prop**2 + fy_coords_prop**2)
+    )
+    # Add batch dimension for broadcasting: [1, H, W]
+    propagator_freq = propagator_freq.unsqueeze(0)
+
+    # 4. Multiply in frequency domain
+    Result_freq = G * propagator_freq # (N, H, W)
+
+    # 5. IFFT to get scaled output field
+    U_sensor_scaled = torch.fft.ifft2(Result_freq, norm='ortho') # (N, H, W)
+
+    # 6. Final scaling and phase factor
+    # exp(j * 2 * pi * z / lambda) / (j * lambda * z)
+    # Note: The TF code has a slightly different constant factor at the end.
+    # TF: compl_exp_tf( (TWO_PI_tf * dist_m) / wavelength_m) / (tf.complex(0.0,1.0) * wavelength_m * dist_m)
+    # which is exp(j * k * z) / (j * lambda * z)
+    # The dx_m factors might also appear here depending on FFT normalization and definitions.
+    # For 'ortho' norm, dx factors are usually handled by the FFT itself.
+    # Let's match the TF version's constant:
+    final_scaling_phase = torch.exp(1j * 2 * torch.pi * dist_m / wavelength_m) / \
+                          (1j * wavelength_m * dist_m)
+    
+    output_field = U_sensor_scaled * final_scaling_phase # (N, H, W)
+
+    return output_field.unsqueeze(1) # Reshape to (N, 1, H, W)
+
+# --- Optical System Module ---
+class ZernikePSFOptimizerPT(nn.Module):
+    def __init__(self, params):
+        super().__init__()
+        self.params = params
+        self.device = params.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
+
+        # Optical parameters
+        self.num_zernike_coeffs = params['num_zernike_coeffs']
+        self.wavelength_m = params['wavelength_m']
+        self.pupil_diameter_m = params['pupil_diameter_m']
+        self.propagation_distance_m = params['propagation_distance_m']
+        self.grid_size_h = params['grid_size_h']
+        self.grid_size_w = params['grid_size_w']
+        
+        # Pixel pitch at pupil plane (element plane)
+        # Assuming the E-field input grid corresponds to the pupil diameter
+        self.pupil_sample_dy_m = self.pupil_diameter_m / self.grid_size_h
+        self.pupil_sample_dx_m = self.pupil_diameter_m / self.grid_size_w
+
+        # Trainable Zernike coefficients
+        self.zernike_coeffs = nn.Parameter(torch.zeros(self.num_zernike_coeffs, device=self.device))
+
+        # Precompute Zernike basis (not trainable)
+        # Radius for Zernike definition is typically normalized to 1.
+        # The physical pupil diameter is used to scale the coordinates.
+        # For zernike_basis, radius_pix should correspond to the circular support within the grid.
+        zernike_radius_pix_h = self.grid_size_h / 2
+        zernike_radius_pix_w = self.grid_size_w / 2
+        # Use min if you want a circle inscribed in a potentially rectangular pupil grid
+        zernike_radius_pix = min(zernike_radius_pix_h, zernike_radius_pix_w)
+
+        _zernike_basis = generate_zernike_basis(
+            self.num_zernike_coeffs,
+            self.grid_size_h,
+            self.grid_size_w,
+            radius_pix=zernike_radius_pix, # This radius is for the normalized [-1,1] domain of Zernikes
+            device=self.device
+        )
+        self.register_buffer('zernike_basis_hwj', _zernike_basis) # (H, W, num_coeffs)
+
+        # Optional: Aperture mask (if not part of input E-field)
+        # For simplicity, assuming input E-field already respects the pupil extent.
+        # If needed, create a circular aperture:
+        y = torch.linspace(-self.grid_size_h // 2, self.grid_size_h // 2 -1, self.grid_size_h, device=self.device) * self.pupil_sample_dy_m
+        x = torch.linspace(-self.grid_size_w // 2, self.grid_size_w // 2 -1, self.grid_size_w, device=self.device) * self.pupil_sample_dx_m
+        Y, X = torch.meshgrid(y, x, indexing='ij')
+        R_sq = X**2 + Y**2
+        pupil_radius_sq = (self.pupil_diameter_m / 2)**2
+        aperture_mask = (R_sq <= pupil_radius_sq).float().unsqueeze(0).unsqueeze(0) # (1,1,H,W)
+        self.register_buffer('aperture_mask_11hw', aperture_mask)
+
+
+    def forward(self, input_E_complex_nchw):
+        """
+        Args:
+            input_E_complex_nchw (torch.Tensor): Input complex E-field (N, 1, H, W).
+        """
+        # 1. Calculate phase OPD from Zernike coefficients
+        # zernike_coeffs: [num_coeffs]
+        # zernike_basis_hwj: [H, W, num_coeffs]
+        # phase_profile_opd_hw: [H, W]
+        phase_profile_opd_hw = phase_from_zernike_coeffs(self.zernike_coeffs, self.zernike_basis_hwj)
+
+        # 2. Convert OPD to phase shift
+        # Phase = 2 * pi * OPD / wavelength
+        # Reshape for broadcasting: [1, 1, H, W]
+        phase_shift_11hw = (2 * torch.pi * phase_profile_opd_hw / self.wavelength_m).unsqueeze(0).unsqueeze(0)
+
+        # 3. Apply phase shift to input E-field
+        # E_out = E_in * exp(i * phase_shift)
+        E_field_pupil_out_n1hw = input_E_complex_nchw * torch.exp(1j * phase_shift_11hw)
+        
+        # 4. (Optional) Apply aperture mask
+        E_field_apertured_n1hw = E_field_pupil_out_n1hw * self.aperture_mask_11hw
+
+        # 5. Propagate to sensor plane
+        E_field_sensor_n1hw = propagate_fresnel_pytorch(
+            E_field_apertured_n1hw,
+            dx_m=(self.pupil_sample_dy_m, self.pupil_sample_dx_m),
+            dist_m=self.propagation_distance_m,
+            wavelength_m=self.wavelength_m
+        )
+
+        # 6. Calculate PSF (intensity)
+        # PSF is |E_field_sensor|^2
+        # Output shape (N, 1, H, W)
+        psf_n1hw = torch.abs(E_field_sensor_n1hw)**2
+
+        return psf_n1hw
+
+# --- Example Custom Loss Function ---
+def example_psf_loss(psf_n1hw, target_psf_n1hw=None):
+    """
+    Example loss function.
+    If target_psf is provided, computes MSE.
+    Otherwise, tries to maximize the peak of the PSF (negative peak value).
+    """
+    if target_psf_n1hw is not None:
+        return torch.mean((psf_n1hw - target_psf_n1hw)**2)
+    else:
+        # Maximize peak: minimize negative peak
+        # Ensure PSF is positive (it should be from abs^2)
+        # For a batch, average the negative peaks
+        N, C, H, W = psf_n1hw.shape
+        psf_peaks = torch.amax(psf_n1hw.view(N, -1), dim=1) # Max over H, W for each batch item
+        return -torch.mean(psf_peaks)
+
+
+# --- Main Training Loop Example ---
+if __name__ == '__main__':
+    print("PyTorch Optical System Prototyping")
+
+    # --- Define parameters ---
+    params = {
+        'num_zernike_coeffs': 5,  # Piston, Tip, Tilt, Defocus, Astigmatism
+        'wavelength_m': 550e-9,    # 550 nm
+        'pupil_diameter_m': 5e-3,  # 5 mm
+        'propagation_distance_m': 50e-3, # 50 mm (e.g., focal length)
+        'grid_size_h': 128,        # Simulation grid height
+        'grid_size_w': 128,        # Simulation grid width
+        'device': 'cuda' if torch.cuda.is_available() else 'cpu',
+
+        # Training parameters
+        'learning_rate': 1e-2,
+        'num_epochs': 100,
+        'batch_size': 4,
+    }
+    print(f"Using device: {params['device']}")
+
+    # Instantiate the model
+    model = ZernikePSFOptimizerPT(params).to(params['device'])
+
+    # Optimizer
+    optimizer = torch.optim.Adam(model.parameters(), lr=params['learning_rate'])
+
+    # Example: Create dummy input E-field data (N, 1, H, W)
+    # For a real scenario, load your actual E-field data
+    # A simple plane wave with Gaussian amplitude:
+    pupil_sample_dy = params['pupil_diameter_m'] / params['grid_size_h']
+    pupil_sample_dx = params['pupil_diameter_m'] / params['grid_size_w']
+    
+    y_p = (torch.arange(params['grid_size_h'], device=params['device']) - params['grid_size_h'] // 2) * pupil_sample_dy
+    x_p = (torch.arange(params['grid_size_w'], device=params['device']) - params['grid_size_w'] // 2) * pupil_sample_dx
+    Y_p, X_p = torch.meshgrid(y_p, x_p, indexing='ij')
+    
+    # Gaussian beam profile
+    beam_waist_factor = 0.4 # beam waist as fraction of pupil radius
+    w0 = (params['pupil_diameter_m'] / 2) * beam_waist_factor
+    gaussian_amplitude = torch.exp(-(X_p**2 + Y_p**2) / (w0**2))
+    
+    # Plane wave phase (e.g., zero phase)
+    phase = torch.zeros_like(gaussian_amplitude)
+    
+    # Create complex E-field: A * exp(i * phase)
+    # Unsqueeze to add batch and channel dimensions for a single input field
+    # Then repeat for batch
+    single_E_field = (gaussian_amplitude * torch.exp(1j * phase)).unsqueeze(0).unsqueeze(0) # (1,1,H,W)
+    dummy_input_E_batch = single_E_field.repeat(params['batch_size'], 1, 1, 1).to(params['device'])
+    
+    print(f"Initial Zernike coeffs: {model.zernike_coeffs.data.cpu().numpy()}")
+
+    # --- Training loop ---
+    for epoch in range(params['num_epochs']):
+        model.train() # Set model to training mode
+
+        # Forward pass
+        psf_output_n1hw = model(dummy_input_E_batch)
+
+        # Calculate loss (using example loss that tries to maximize PSF peak)
+        loss = example_psf_loss(psf_output_n1hw)
+
+        # Backward pass and optimization
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        if (epoch + 1) % 10 == 0 or epoch == 0:
+            print(f"Epoch [{epoch+1}/{params['num_epochs']}], Loss: {loss.item():.6e}")
+            # print(f"  Zernike coeffs: {model.zernike_coeffs.data.cpu().numpy()}")
+
+    print("Training finished.")
+    print(f"Final Zernike coeffs: {model.zernike_coeffs.data.cpu().numpy()}")
+
+    # --- Example: Get a PSF after training ---
+    model.eval()
+    with torch.no_grad():
+        final_psf = model(dummy_input_E_batch[0:1,...]) # Get PSF for one input
+        print(f"Shape of a single output PSF: {final_psf.shape}")
+        # You can now visualize or further analyze final_psf (e.g., save it)
+        # import matplotlib.pyplot as plt
+        # plt.imshow(final_psf.squeeze().cpu().numpy())
+        # plt.colorbar()
+        # plt.title("Optimized PSF (Intensity)")
+        # plt.show()
+
