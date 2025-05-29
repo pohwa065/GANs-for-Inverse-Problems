@@ -669,3 +669,155 @@ class PixelAttnUNet(nn.Module):
         d1 = self.dec1(torch.cat([up1, crop_tensor(e1, up1)], dim=1))
         return self.final_conv(d1)
 
+###### 05282025
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# -----------------------------
+# Inception Block
+# -----------------------------
+class InceptionBlock(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        mid = out_ch // 4
+        self.branch1 = nn.Conv2d(in_ch, mid, kernel_size=1, padding=0)
+        self.branch3 = nn.Conv2d(in_ch, mid, kernel_size=3, padding=1)
+        self.branch5 = nn.Conv2d(in_ch, mid, kernel_size=5, padding=2)
+        self.branch_pool = nn.Conv2d(in_ch, mid, kernel_size=1, padding=0)
+
+    def forward(self, x):
+        b1 = self.branch1(x)
+        b3 = self.branch3(x)
+        b5 = self.branch5(x)
+        bp = self.branch_pool(F.max_pool2d(x, 3, stride=1, padding=1))
+        return torch.cat([b1, b3, b5, bp], dim=1)  # out_ch = mid*4
+
+# -----------------------------
+# Per-Pixel Channel Attention
+# -----------------------------
+class PixelChannelAttention(nn.Module):
+    def __init__(self, C):
+        super().__init__()
+        self.conv1x1 = nn.Conv2d(C, C, kernel_size=1, bias=False)
+    def forward(self, x):
+        w = torch.softmax(self.conv1x1(x), dim=1)
+        return x * w
+
+class PixelCrossChannelAttention(nn.Module):
+    def __init__(self, C):
+        super().__init__()
+        self.conv1x1 = nn.Conv2d(C, C, kernel_size=1, bias=False)
+    def forward(self, main, cond):
+        w = torch.softmax(self.conv1x1(cond), dim=1)
+        return main * w
+
+# -----------------------------
+# Deeper Inception + PixelAttn UNet
+# -----------------------------
+class DeepIncepPixelAttnUNet(nn.Module):
+    def __init__(self, in_ch, base_ch=64):
+        super().__init__()
+        C0, C1, C2, C3, C4 = in_ch, base_ch, base_ch*2, base_ch*4, base_ch*8
+
+        # cross-attn on input
+        self.xattn_in = PixelCrossChannelAttention(C0)
+
+        # Encoder
+        self.inc1 = nn.Sequential(
+            InceptionBlock(C0, C1), nn.ReLU(),
+            PixelChannelAttention(C1)
+        )
+        self.pool1 = nn.MaxPool2d(2)
+
+        self.inc2 = nn.Sequential(
+            InceptionBlock(C1, C2), nn.ReLU(),
+            PixelChannelAttention(C2)
+        )
+        self.pool2 = nn.MaxPool2d(2)
+
+        self.inc3 = nn.Sequential(
+            InceptionBlock(C2, C3), nn.ReLU(),
+            PixelChannelAttention(C3)
+        )
+        self.pool3 = nn.MaxPool2d(2)
+
+        # Bottleneck
+        self.middle = nn.Sequential(
+            InceptionBlock(C3, C4), nn.ReLU(),
+            PixelChannelAttention(C4)
+        )
+
+        # Decoder (resize-then-conv)
+        self.up3 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(C4, C3, kernel_size=3, padding=1), nn.ReLU(),
+            PixelChannelAttention(C3)
+        )
+        self.xattn3 = PixelCrossChannelAttention(C3)
+        self.dec3 = nn.Sequential(
+            InceptionBlock(C3*2, C3), nn.ReLU(),
+            PixelChannelAttention(C3)
+        )
+
+        self.up2 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(C3, C2, kernel_size=3, padding=1), nn.ReLU(),
+            PixelChannelAttention(C2)
+        )
+        self.xattn2 = PixelCrossChannelAttention(C2)
+        self.dec2 = nn.Sequential(
+            InceptionBlock(C2*2, C2), nn.ReLU(),
+            PixelChannelAttention(C2)
+        )
+
+        self.up1 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(C2, C1, kernel_size=3, padding=1), nn.ReLU(),
+            PixelChannelAttention(C1)
+        )
+        self.xattn1 = PixelCrossChannelAttention(C1)
+        self.dec1 = nn.Sequential(
+            InceptionBlock(C1*2, C1), nn.ReLU(),
+            PixelChannelAttention(C1)
+        )
+
+        # Final 1x1
+        self.final = nn.Conv2d(C1, 1, kernel_size=1)
+
+    def forward(self, x):
+        # x: (B, C0, H, W)
+        x = self.xattn_in(x, x)
+
+        # enc1
+        e1 = self.inc1(x)               # (B,  C1, H,   W)
+        p1 = self.pool1(e1)             # (B,  C1, H/2, W/2)
+
+        # enc2
+        e2 = self.inc2(p1)              # (B,  C2, H/2, W/2)
+        p2 = self.pool2(e2)             # (B,  C2, H/4, W/4)
+
+        # enc3
+        e3 = self.inc3(p2)              # (B,  C3, H/4, W/4)
+        p3 = self.pool3(e3)             # (B,  C3, H/8, W/8)
+
+        # bottleneck
+        m = self.middle(p3)             # (B,  C4, H/8, W/8)
+
+        # dec3
+        u3 = self.up3(m)                # (B,  C3, H/4, W/4)
+        e3g = self.xattn3(e3, u3)       # (B,  C3, H/4, W/4)
+        d3 = self.dec3(torch.cat([u3, e3g], dim=1))  # (B, C3, H/4, W/4)
+
+        # dec2
+        u2 = self.up2(d3)               # (B,  C2, H/2, W/2)
+        e2g = self.xattn2(e2, u2)       # (B,  C2, H/2, W/2)
+        d2 = self.dec2(torch.cat([u2, e2g], dim=1))  # (B, C2, H/2, W/2)
+
+        # dec1
+        u1 = self.up1(d2)               # (B,  C1, H,   W)
+        e1g = self.xattn1(e1, u1)       # (B,  C1, H,   W)
+        d1 = self.dec1(torch.cat([u1, e1g], dim=1))  # (B, C1, H,   W)
+
+        return self.final(d1)           # (B,   1, H,   W)
