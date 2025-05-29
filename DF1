@@ -821,3 +821,238 @@ class DeepIncepPixelAttnUNet(nn.Module):
         d1 = self.dec1(torch.cat([u1, e1g], dim=1))  # (B, C1, H,   W)
 
         return self.final(d1)           # (B,   1, H,   W)
+
+
+
+##### 05282025 2nd
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# ----------------------------------------------------
+# 1) Residual‐Inception Block (with GroupNorm & dilation)
+# ----------------------------------------------------
+class ResidualInceptionBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, dilation=1):
+        super().__init__()
+        mid = out_ch // 4
+        # 1×1
+        self.b1 = nn.Sequential(
+            nn.Conv2d(in_ch, mid, kernel_size=1, bias=False),
+            nn.GroupNorm(min(mid,32), mid),
+            nn.ReLU(inplace=True)
+        )
+        # 3×3
+        self.b3 = nn.Sequential(
+            nn.Conv2d(in_ch, mid, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(min(mid,32), mid),
+            nn.ReLU(inplace=True)
+        )
+        # 5×5 (via dilation)
+        self.b5 = nn.Sequential(
+            nn.Conv2d(in_ch, mid, kernel_size=3, 
+                      padding=2*dilation, dilation=dilation, bias=False),
+            nn.GroupNorm(min(mid,32), mid),
+            nn.ReLU(inplace=True)
+        )
+        # pooled branch
+        self.bp = nn.Sequential(
+            nn.MaxPool2d(3, stride=1, padding=1),
+            nn.Conv2d(in_ch, mid, kernel_size=1, bias=False),
+            nn.GroupNorm(min(mid,32), mid),
+            nn.ReLU(inplace=True)
+        )
+        # if dimensions change, project for residual
+        self.res_conv = None
+        if in_ch != out_ch:
+            self.res_conv = nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False)
+        self.out_relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        y = torch.cat([self.b1(x), self.b3(x), self.b5(x), self.bp(x)], dim=1)
+        res = x if self.res_conv is None else self.res_conv(x)
+        return self.out_relu(y + res)
+
+# ----------------------------------------------------
+# 2) Pixel-wise Channel & Cross-Channel Attention
+# ----------------------------------------------------
+class PixelChannelAttention(nn.Module):
+    def __init__(self, C):
+        super().__init__()
+        self.conv1x1 = nn.Conv2d(C, C, kernel_size=1, bias=False)
+    def forward(self, x):
+        w = torch.softmax(self.conv1x1(x), dim=1)
+        return x * w
+
+class PixelCrossChannelAttention(nn.Module):
+    def __init__(self, C):
+        super().__init__()
+        self.conv1x1 = nn.Conv2d(C, C, kernel_size=1, bias=False)
+    def forward(self, main, cond):
+        w = torch.softmax(self.conv1x1(cond), dim=1)
+        return main * w
+
+# ----------------------------------------------------
+# 3) Spatial Attention (CBAM style)
+# ----------------------------------------------------
+class SpatialAttention(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv = nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=False)
+    def forward(self, x):
+        avg = x.mean(dim=1, keepdim=True)
+        mx, _ = x.max(dim=1, keepdim=True)
+        attn = torch.sigmoid(self.conv(torch.cat([avg, mx], dim=1)))
+        return x * attn
+
+# ----------------------------------------------------
+# 4) The Enhanced Deep Inception + PixelAttn UNet
+# ----------------------------------------------------
+class DeepIncepPixelAttnUNet(nn.Module):
+    def __init__(self, in_ch, base_ch=64, transformer_heads=8):
+        super().__init__()
+        C0 = in_ch
+        C1, C2, C3, C4 = base_ch, base_ch*2, base_ch*4, base_ch*8
+
+        # initial cross-attn on input
+        self.xattn_in = PixelCrossChannelAttention(C0)
+
+        # Encoder
+        self.inc1 = nn.Sequential(
+            ResidualInceptionBlock(C0, C1, dilation=1),
+            PixelChannelAttention(C1),
+            SpatialAttention()
+        )
+        self.pool1 = nn.MaxPool2d(2)
+
+        self.inc2 = nn.Sequential(
+            ResidualInceptionBlock(C1, C2, dilation=2),
+            PixelChannelAttention(C2),
+            SpatialAttention()
+        )
+        self.pool2 = nn.MaxPool2d(2)
+
+        self.inc3 = nn.Sequential(
+            ResidualInceptionBlock(C2, C3, dilation=4),
+            PixelChannelAttention(C3),
+            SpatialAttention()
+        )
+        self.pool3 = nn.MaxPool2d(2)
+
+        # Bottleneck + Transformer
+        self.middle = nn.Sequential(
+            ResidualInceptionBlock(C3, C4, dilation=2),
+            PixelChannelAttention(C4),
+            SpatialAttention()
+        )
+        self.transformer = nn.TransformerEncoderLayer(
+            d_model=C4, nhead=transformer_heads,
+            dim_feedforward=C4*4, dropout=0.1, activation='relu'
+        )
+
+        # Decoder stage 3
+        self.up3 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(C4, C3, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(min(C3,32), C3),
+            nn.ReLU(inplace=True),
+            PixelChannelAttention(C3),
+            SpatialAttention()
+        )
+        self.xattn3 = PixelCrossChannelAttention(C3)
+        self.dec3  = nn.Sequential(
+            ResidualInceptionBlock(C3*2, C3, dilation=1),
+            PixelChannelAttention(C3),
+            SpatialAttention()
+        )
+
+        # Decoder stage 2
+        self.up2 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(C3, C2, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(min(C2,32), C2),
+            nn.ReLU(inplace=True),
+            PixelChannelAttention(C2),
+            SpatialAttention()
+        )
+        self.xattn2 = PixelCrossChannelAttention(C2)
+        self.dec2  = nn.Sequential(
+            ResidualInceptionBlock(C2*2, C2, dilation=1),
+            PixelChannelAttention(C2),
+            SpatialAttention()
+        )
+
+        # Decoder stage 1
+        self.up1 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(C2, C1, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(min(C1,32), C1),
+            nn.ReLU(inplace=True),
+            PixelChannelAttention(C1),
+            SpatialAttention()
+        )
+        self.xattn1 = PixelCrossChannelAttention(C1)
+        self.dec1  = nn.Sequential(
+            ResidualInceptionBlock(C1*2, C1, dilation=1),
+            PixelChannelAttention(C1),
+            SpatialAttention()
+        )
+
+        # Final conv + deep supervision heads
+        self.final = nn.Conv2d(C1, 1, kernel_size=1)
+        self.sup3  = nn.Conv2d(C3, 1, kernel_size=1)
+        self.sup2  = nn.Conv2d(C2, 1, kernel_size=1)
+        self.sup1  = nn.Conv2d(C1, 1, kernel_size=1)
+
+    def forward(self, x):
+        B, _, H, W = x.shape
+
+        # input attn
+        x = self.xattn_in(x, x)
+
+        # --- encoder ---
+        e1 = self.inc1(x)          # → (B, C1, H,   W)
+        p1 = self.pool1(e1)        # → (B, C1, H/2, W/2)
+
+        e2 = self.inc2(p1)         # → (B, C2, H/2, W/2)
+        p2 = self.pool2(e2)        # → (B, C2, H/4, W/4)
+
+        e3 = self.inc3(p2)         # → (B, C3, H/4, W/4)
+        p3 = self.pool3(e3)        # → (B, C3, H/8, W/8)
+
+        # bottleneck + transformer
+        m  = self.middle(p3)       # → (B, C4, H/8, W/8)
+        # flatten for transformer: (H/8*W/8, B, C4)
+        seq = m.flatten(2).permute(2,0,1)
+        t  = self.transformer(seq).permute(1,2,0).view(B, -1, p3.size(2), p3.size(3))
+        m  = m + t                 # residual
+
+        # --- decoder stage 3 ---
+        u3 = self.up3(m)           # → (B, C3, H/4, W/4)
+        e3g = self.xattn3(e3, u3)  # → (B, C3, H/4, W/4)
+        d3  = self.dec3(torch.cat([u3, e3g], dim=1))  # → (B, C3, H/4, W/4)
+
+        # --- decoder stage 2 ---
+        u2 = self.up2(d3)          # → (B, C2, H/2, W/2)
+        e2g = self.xattn2(e2, u2)  # → (B, C2, H/2, W/2)
+        d2  = self.dec2(torch.cat([u2, e2g], dim=1))  # → (B, C2, H/2, W/2)
+
+        # --- decoder stage 1 ---
+        u1 = self.up1(d2)          # → (B, C1, H,   W)
+        e1g= self.xattn1(e1, u1)   # → (B, C1, H,   W)
+        d1  = self.dec1(torch.cat([u1, e1g], dim=1))  # → (B, C1, H,   W)
+
+        # --- outputs + deep supervision ---
+        out  = self.final(d1)                                      # (B, 1, H,   W)
+        s3   = F.interpolate(self.sup3(d3), size=(H,W), mode='bilinear', align_corners=False)
+        s2   = F.interpolate(self.sup2(d2), size=(H,W), mode='bilinear', align_corners=False)
+        s1   = self.sup1(d1)                                       # (B, 1, H,   W)
+
+        return {
+            'out': out,
+            'sup1': s1,
+            'sup2': s2,
+            'sup3': s3
+        }
