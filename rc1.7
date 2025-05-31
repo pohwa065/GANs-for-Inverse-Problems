@@ -514,3 +514,509 @@ if __name__ == "__main__":
     
     print("One-step denoised image shape:", x0_pred.shape)
     print("Iteratively refined image shape:", x0_refined.shape)
+
+
+####### 05302025 ver ###########
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+#############################################
+# Helper: Time Embedding
+#############################################
+def get_timestep_embedding(timesteps, embedding_dim):
+    """
+    Generate sinusoidal embeddings for time steps.
+    (Even though we fix t=1 for one-step denoising, this remains for compatibility.)
+    
+    timesteps: Tensor of shape (n,) with integer time steps.
+    embedding_dim: Dimension of the embedding.
+    """
+    half_dim = embedding_dim // 2
+    emb = math.log(10000) / (half_dim - 1)
+    emb = torch.exp(torch.arange(half_dim, device=timesteps.device) * -emb)
+    emb = timesteps.float().unsqueeze(1) * emb.unsqueeze(0)
+    emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
+    if embedding_dim % 2 == 1:
+        emb = F.pad(emb, (0, 1))
+    return emb
+
+#############################################
+# Attention Blocks
+#############################################
+class ChannelAttention(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        # Use 1x1 convolution for pixel-level attention weights
+        self.conv1x1 = nn.Conv2d(in_channels, in_channels, kernel_size=1, bias=False)
+    def forward(self, x):
+        # Compute attention weights per pixel along the channel dimension
+        attn = torch.softmax(self.conv1x1(x), dim=1)
+        return x * attn
+
+class CrossChannelAttention(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        # Use 1x1 convolution on the conditioning input for pixel-level attention weights
+        self.conv1x1 = nn.Conv2d(in_channels, in_channels, kernel_size=1, bias=False)
+    def forward(self, x, cond):
+        # Compute attention weights from the conditioning features per pixel
+        attn = torch.softmax(self.conv1x1(cond), dim=1)
+        return x * attn
+
+#############################################
+# Residual Block with Cross–Channel Attention
+#############################################
+class ResidualBlockWithCrossAttention(nn.Module):
+    def __init__(self, in_channels, out_channels, time_emb_dim, reduction=16, cond_channels=None):
+        """
+        A residual block that:
+          - Applies two 3×3 convolutions.
+          - Injects a time embedding.
+          - Applies standard channel attention.
+          - Applies cross-channel attention if conditioning is provided.
+          - Uses a skip connection (with 1×1 conv if needed).
+        """
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.time_emb_proj = nn.Linear(time_emb_dim, out_channels)
+        self.activation = nn.ReLU(inplace=True)
+        self.skip_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else None
+        self.channel_attention = Chan1nelAttention(out_channels, reduction=reduction)
+        self.cross_attention = CrossChannelAttention(out_channels, reduction=reduction)
+        
+        # Set up conditioning projection if cond_channels do not match out_channels.   #4/13
+        if cond_channels is None:
+            cond_channels = out_channels
+        self.cond_proj = nn.Conv2d(cond_channels, out_channels, kernel_size=1) if cond_channels != out_channels else None
+
+    def forward(self, x, t_emb, cond=None):
+        #print("x.shape", x.shape)  # Shape: (n, in_channels, H, W)
+        h = self.activation(self.conv1(x))
+        #print("h.shape", h.shape)
+        # Project time embedding to match the feature channels.
+        t_emb_proj = self.time_emb_proj(t_emb).unsqueeze(-1).unsqueeze(-1)
+        h = h + t_emb_proj
+        #print("h.shape", h.shape)  # Shape: (n, out_channels, H, W)
+        h = self.conv2(h)
+        #print("h.shape", h.shape)  # Shape: (n, out_channels, H, W)
+        h = self.channel_attention(h)
+        #print("h.shape", h.shape)  # Shape: (n, out_channels, H, W)
+        if cond is not None:
+            #print("cond.shape", cond.shape) ## Shape: (n, cond_channels, H, W)
+            if self.cond_proj is not None:   #4/13
+                cond = self.cond_proj(cond)  #4/13
+                #print("cond.shape", cond.shape)
+            h = self.cross_attention(h, cond)  #cond = prior_features
+        if self.skip_conv is not None:
+            x = self.skip_conv(x)
+        return self.activation(h + x)
+
+#############################################
+# Multi-Scale Prior Encoder
+#############################################
+class MultiScalePriorEncoder(nn.Module):
+    def __init__(self, in_channels=3, feature_channels=16, num_levels=3, kernel_size=3):
+        super().__init__()
+        self.num_levels = num_levels
+        self.convs = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(in_channels if i==0 else feature_channels, feature_channels, kernel_size=kernel_size, stride=2, padding=1),
+                nn.ReLU(inplace=True)
+            ) for i in range(num_levels)
+        ])
+    def forward(self, x):
+        features = []
+        for conv in self.convs:
+            x = conv(x)
+            print("prior x.shape", x.shape)  # Shape: (n, feature_channels, H/2^i, W/2^i)
+            features.append(x)
+        return features
+    
+
+#############################################
+# Inception Block
+#############################################
+class InceptionBlock(nn.Module):
+    def __init__(self, in_channels, branch_channels):
+        super().__init__()
+        # 1×1 branch
+        self.branch1 = nn.Conv2d(in_channels, branch_channels, kernel_size=1)
+        # 1×1 → 3×3 branch
+        self.branch2 = nn.Sequential(
+            nn.Conv2d(in_channels, branch_channels, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(branch_channels, branch_channels, kernel_size=3, padding=1)
+        )
+        # 1×1 → 3×3 → 3×3 branch
+        self.branch3 = nn.Sequential(
+            nn.Conv2d(in_channels, branch_channels, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(branch_channels, branch_channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(branch_channels, branch_channels, kernel_size=3, padding=1)
+        )
+
+    def forward(self, x):
+        b1 = self.branch1(x)
+        b2 = self.branch2(x)
+        b3 = self.branch3(x)
+        return torch.cat([b1, b2, b3], dim=1)
+
+
+#############################################
+# Simple Un-conditional Velocity Predictor
+#############################################
+# Adjusted VelocityUNet: slightly deeper and using an inception block to compute a residual.
+class VelocityUNet(nn.Module):
+    def __init__(self, in_ch=2, base_ch=64, time_dim=128):
+        super().__init__()
+        self.time_proj = nn.Linear(time_dim, time_dim)
+        # Encoder
+        self.down1 = nn.Sequential(
+            nn.Conv2d(in_ch, base_ch, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        self.down2 = nn.Sequential(
+            nn.Conv2d(base_ch, base_ch*2, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        # New extra down block for deeper features
+        self.down3 = nn.Sequential(
+            nn.Conv2d(base_ch*2, base_ch*4, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        # Decoder
+        self.up1 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(base_ch*4, base_ch*2, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        self.up2 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(base_ch*2, base_ch, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        # Inception branch to learn residual correction on the skip connection.
+        # After up2, we concatenate with down1 (both of channel: base_ch) => 2*base_ch channels.
+        # The inception block outputs 3*(base_ch//2) channels; we then project back to 2*base_ch.
+        self.incep = InceptionBlock(2*base_ch, base_ch//2)
+        self.res_conv = nn.Conv2d(3*(base_ch//2), 2*base_ch, kernel_size=1)
+        # Final residual block using cross-attention (no conditioning used)
+        self.res = ResidualBlockWithCrossAttention(
+            in_channels=2*base_ch, out_channels=base_ch, time_emb_dim=time_dim, reduction=16, cond_channels=base_ch
+        )
+        self.head = nn.Conv2d(base_ch, in_ch, kernel_size=3, padding=1)
+        self.act  = nn.ReLU(inplace=True)
+
+    def forward(self, x, t):
+        t_emb = get_timestep_embedding(t, self.time_proj.in_features)
+        t_emb = self.time_proj(t_emb)
+        d1 = self.down1(x)                  # (B, base_ch, H, W)
+        d2 = self.down2(d1)                 # (B, 2*base_ch, H/2, W/2)
+        d3 = self.down3(d2)                 # (B, 4*base_ch, H/4, W/4)
+        u1 = self.act(self.up1(d3))         # (B, 2*base_ch, H/2, W/2)
+        u2 = self.act(self.up2(u1))         # (B, base_ch, H, W)
+        # Concatenate skip connection from d1 and u2 along channel dimension
+        cat = torch.cat([d1, u2], dim=1)      # (B, 2*base_ch, H, W)
+        # Inception branch to learn residual from concatenated features
+        residue = self.incep(cat)
+        residue = self.res_conv(residue)
+        cat = cat + residue                # Residual fusion
+        out = self.res(cat, t_emb, cond=None)
+        return self.head(out)
+
+#############################################
+# Discriminator (Patch-GAN)
+#############################################
+class PatchDiscriminator(nn.Module):
+    def __init__(self, in_ch=2, base=64):
+        super().__init__()
+        def blk(cin, cout, s):
+            return nn.Sequential(
+                nn.Conv2d(cin, cout, 4, stride=s, padding=1),
+                nn.LeakyReLU(0.2, True)
+            )
+        self.net = nn.Sequential(
+            blk(in_ch,     base,   2),
+            blk(base,      base*2, 2),
+            blk(base*2,    base*4, 2),
+            nn.Conv2d(base*4, 1, 4, padding=1)  # logits
+        )
+    def forward(self, x):
+        return self.net(x)
+
+
+#############################################
+# VGG perceptual helper  (conv1_2 + conv2_2)
+#############################################
+from torchvision.models import vgg16
+
+_vgg_feat = vgg16(weights="DEFAULT").features.eval()
+for p in _vgg_feat.parameters(): p.requires_grad = False
+def perceptual_L1(x, y):
+    # expects 3-channel RGB in 0..1; convert if grey-scale
+    if x.shape[1] == 1:
+        x = x.repeat(1,3,1,1)
+        y = y.repeat(1,3,1,1)
+    feats = []
+    curx, cury = x, y
+    for i, layer in _vgg_feat._modules.items():
+        curx = layer(curx); cury = layer(cury)
+        if i in {"3", "8"}:   # relu1_2, relu2_2
+            feats.append(F.l1_loss(curx, cury))
+        if i == "8": break
+    return sum(feats)
+
+
+#############################################
+# Laplacian consistency  (|Δx0_pred – Δx0|)
+#############################################
+_lap_kernel = torch.tensor([[0,  1, 0],
+                            [1, -4, 1],
+                            [0,  1, 0]], dtype=torch.float32).view(1,1,3,3)
+def laplacian(img):
+    k = _lap_kernel.to(img.device)
+    ch = img.shape[1]
+    k = k.repeat(ch,1,1,1)
+    return F.conv2d(img, k, padding=1, groups=ch)
+
+##############################################
+# Prior Downsampling (similar to eDR)
+##############################################
+# Modified generate_prior_ds function to fix channel grouping error
+def generate_prior_ds(prior_hr, x0_hat, device="cuda"):
+    """
+    Downsamples the high-res prior using custom convolution.
+    Args:
+      prior_hr: Tensor of shape (N, c, H, W)
+      x0_hat: Tensor of shape (N, ?, h, w) used to determine downsample size.
+    Process:
+      1. Select odd channels (channels at odd indices) from prior_hr yielding c_odd = c // 2.
+      2. Compute kernel_h = H // h and kernel_w = W // w.
+      3. For each odd channel, create kernel masks of shape (kernel_h, kernel_w) that are all 0’s
+         except for a single 1 at each possible (i,j) position. This gives kernel_h * kernel_w kernels per channel.
+      4. Convolve prior_hr (using group convolution) with these kernels with stride (kernel_h, kernel_w).
+      5. Return a tensor of shape (N, c_odd * kernel_h * kernel_w, h, w).
+    """
+    import torch.nn.functional as F
+    N, c, H, W = prior_hr.shape
+    _, _, h, w = x0_hat.shape
+    kernel_h = H // h
+    kernel_w = W // w
+    
+    # Select odd channels; assume channels at odd indices (1,3,...)
+    prior_odd = prior_hr[:, 1::2, :, :]  # shape: (N, c_odd, H, W), where c_odd = c // 2
+    c_odd = prior_odd.shape[1]
+    
+    # Create weight tensor for grouped convolution with groups=c_odd.
+    # For grouped conv, weight shape should be (c_odd * kernel_h*kernel_w, 1, kernel_h, kernel_w)
+    weight = prior_hr.new_zeros((c_odd * kernel_h * kernel_w, 1, kernel_h, kernel_w))
+    for g in range(c_odd):
+        for i in range(kernel_h):
+            for j in range(kernel_w):
+                idx = g * (kernel_h * kernel_w) + i * kernel_w + j
+                weight[idx, 0, i, j] = 1.0
+    
+    # Convolve prior_odd with weight using groups=c_odd
+    #print("prior_odd.shape", prior_odd.shape)  # Shape: (N, c_odd, H, W)
+    #print("weight.shape", weight.shape)        # Shape: (c_odd * kernel_h * kernel_w, 1, kernel_h, kernel_w)
+    
+    prior_ds = F.conv2d(prior_odd, weight, bias=None, stride=(kernel_h, kernel_w), groups=c_odd)
+    #print("prior_ds.shape", prior_ds.shape)  # Shape: (N, c_odd * kernel_h * kernel_w, 1, kernel_h, kernel_w, h, w)
+    return prior_ds
+
+#############################################
+# shift MSE loss
+
+def shifted_mse_loss(image1, image2):
+    """
+    For each sample n, compute the MSE loss between the first channel of image1[n] and each channel of image2[n].
+    For a given channel, iterate over all 3×3 shifts (x and y in [-1, 0, 1]) applied to image1.
+    The loss for that channel is the minimum MSE loss over shifts, and the sample loss is the minimum over channels.
+    Returns the average sample loss.
+    """
+    N, C, H, W = image1.shape
+    sample_losses = []
+    for n in range(N):
+        m_losses = []
+        base = image1[n, 0, :, :]
+        for m in range(image2.shape[1]):
+            min_loss = None
+            for shift_y in [-1, 0, 1]:
+                for shift_x in [-1, 0, 1]:
+                    if shift_x >= 0:
+                        x1_start = shift_x
+                        crop_W = W - shift_x
+                    else:
+                        x1_start = 0
+                        crop_W = W + shift_x
+                    if shift_y >= 0:
+                        y1_start = shift_y
+                        crop_H = H - shift_y
+                    else:
+                        y1_start = 0
+                        crop_H = H + shift_y
+                    if crop_W <= 0 or crop_H <= 0:
+                        continue
+                    shifted_region = base[y1_start:y1_start+crop_H, x1_start:x1_start+crop_W]
+                    region_image2 = image2[n, m, 0:crop_H, 0:crop_W]
+                    loss = F.mse_loss(shifted_region, region_image2, reduction='mean')
+                    if min_loss is None or loss < min_loss:
+                        min_loss = loss
+            m_losses.append(min_loss)
+        sample_losses.append(min(m_losses))
+    return torch.stack(sample_losses).mean()
+##############################################
+
+#############################################
+# Training Pipeline for One-Step Conditional Denoising
+#############################################
+def train_one_step(model, D, dataloader,
+                   epochs, image_size, alpha_bar, mu_range, sigma_range,
+                   λ_col, λ_prior, λ_perc, λ_gan, λ_lap,
+                   device, val_dataloader=None):
+    G_opt = torch.optim.Adam(model.parameters(), lr=2e-4, betas=(0.5,0.999))
+    D_opt = torch.optim.Adam(D.parameters(),     lr=2e-4, betas=(0.5,0.999))
+
+    sqrt_ab   = math.sqrt(alpha_bar)
+    sqrt_1ab  = math.sqrt(1-alpha_bar)
+    model.train();  D.train()
+
+    for epoch in range(epochs):
+        # --- Training Loop -------------------------------------------
+        for x0, prior_hr in dataloader:
+            x0 = x0.to(device);  prior_hr = prior_hr.to(device)
+            batch_size,_,H,W = x0.shape
+            t = torch.ones(batch_size, device=device, dtype=torch.long)
+            mu = torch.rand(batch_size, 1, 1, W, device=device) * (mu_range[1]-mu_range[0]) + mu_range[0]
+
+            # multimodel noise
+            p_low = 0.5        # probability of low sigma mode
+            eps_low  = torch.randn(batch_size,1,1,W, device=device).abs()
+            eps_high = torch.randn_like(eps_low).abs()
+            mode_selector = torch.rand(batch_size, 1, 1, 1, device=device)
+            sigma_low = sigma_range[0] * eps_low
+            sigma_high = sigma_range[1] * eps_high
+            sigma_mode = torch.where(mode_selector < p_low, sigma_low, sigma_high)
+
+            noise = mu + sigma_mode * torch.randn(batch_size, x0.size(1), H, W, device=device)
+            x1 = sqrt_ab * x0 + sqrt_1ab * noise
+            
+            # normalize x1 to [0,1] range
+            #x1 = (x1 - x1.min()) / (x1.max() - x1.min())   # keep original scale
+            
+            with torch.no_grad():
+                v_pred = model(x1, t)
+                x0_hat = sqrt_ab * x1 - sqrt_1ab * v_pred
+            D_real = D(x0);  D_fake = D(x0_hat)
+            loss_D = (F.relu(1.-D_real).mean() + F.relu(1.+D_fake).mean())
+            D_opt.zero_grad();  loss_D.backward();  D_opt.step()
+            
+            v_pred = model(x1, t)
+            # Inversion: corrected to use x1 instead of x0
+            x0_hat = sqrt_ab * x1 + (- sqrt_1ab) * v_pred
+            v_true   = sqrt_ab * noise - sqrt_1ab * x0
+            loss_mse = F.mse_loss(v_pred, v_true)
+            loss_col = F.mse_loss(v_pred, v_pred.mean(2, keepdim=True))
+            prior_ds = generate_prior_ds(prior_hr, x0_hat, device=device)
+            loss_prior = shifted_mse_loss(x0_hat, prior_ds)
+            loss_gan = -D(x0_hat).mean()
+
+            #   perceptual & laplacian of x0_hat and x0 using 1st channel only
+            x0_hat_1 = x0_hat[:, 0:1, :, :]
+            x0_1     = x0[:, 0:1, :, :]
+            loss_perc = perceptual_L1(x0_hat_1.clamp(0,1), x0_1.clamp(0,1))
+            loss_lap  = F.l1_loss(laplacian(x0_hat_1), laplacian(x0_1))
+            loss_G = (loss_mse
+                      + λ_col*loss_col
+                      + λ_prior*loss_prior
+                      + λ_perc*loss_perc
+                      + λ_lap*loss_lap
+                      + λ_gan*loss_gan)
+            
+            G_opt.zero_grad(); loss_G.backward(); G_opt.step()
+        
+        # --- Validation Loop (if provided) -------------------------
+        if val_dataloader is not None:
+            model.eval()
+            val_losses = []
+            with torch.no_grad():
+                for x0, prior_hr in val_dataloader:
+                    x0 = x0.to(device);  prior_hr = prior_hr.to(device)
+                    batch_size, _, H, W = x0.shape
+                    t = torch.ones(batch_size, device=device, dtype=torch.long)
+                    mu = torch.rand(batch_size, 1, 1, W, device=device) * (mu_range[1] - mu_range[0]) + mu_range[0]
+                    # new noise generation code start for validation
+                    p_low = 0.5        # probability of low sigma mode
+                    mode_selector = torch.rand(batch_size, 1, 1, 1, device=device)
+                    eps_low  = torch.randn(batch_size,1,1,W, device=device).abs()
+                    eps_high = torch.randn_like(eps_low).abs()
+                    sigma_low = sigma_range[0] * eps_low
+                    sigma_high = sigma_range[1] * eps_high
+                    sigma_mode = torch.where(mode_selector < p_low, sigma_low, sigma_high)
+                    noise = mu + sigma_mode * torch.randn(batch_size, x0.size(1), H, W, device=device)
+                    x1 = sqrt_ab * x0 + sqrt_1ab * noise
+                    # normalize x1 to [0,1] range
+                    #x1 = (x1 - x1.min()) / (x1.max() - x1.min())   # keep original scale
+                    # new noise generation code end for validation
+                    v_pred = model(x1, t)
+                    x0_hat = sqrt_ab * x1 - sqrt_1ab * v_pred
+                    v_true = sqrt_ab * noise - sqrt_1ab * x0
+                    loss_mse = F.mse_loss(v_pred, v_true)
+                    loss_col = F.mse_loss(v_pred, v_pred.mean(2, keepdim=True))
+                    prior_ds = generate_prior_ds(prior_hr, x0_hat, device=device)
+                    loss_prior = shifted_mse_loss(x0_hat, prior_ds)
+                    loss_gan = -D(x0_hat).mean()
+                    x0_hat_1 = x0_hat[:, 0:1, :, :]
+                    x0_1     = x0[:, 0:1, :, :]
+                    loss_perc = perceptual_L1(x0_hat_1.clamp(0,1), x0_1.clamp(0,1))
+                    loss_lap = F.l1_loss(laplacian(x0_hat_1), laplacian(x0_1))
+                    loss_G_val = (loss_mse + λ_col*loss_col + λ_prior*loss_prior + λ_perc*loss_perc + λ_lap*loss_lap + λ_gan*loss_gan)
+                    val_losses.append(loss_G_val.item())
+            avg_val_loss = sum(val_losses)/len(val_losses) if val_losses else 0.0
+            print(f"Epoch {epoch+1}/{epochs} - Training Loss: {loss_G.item():.6f} | Validation Loss: {avg_val_loss:.6f}")
+            model.train()
+        else:
+            print(f"Epoch {epoch+1}/{epochs} - Training Loss: {loss_G.item():.6f}")
+
+#############################################
+# Inference Pipeline: One-Step Conditional Denoising
+#############################################
+def denoise_one_step_conditional(model, x1, alpha_bar, high_res_prior, device="cuda"):
+    """
+    Given a noisy image x1 and a high-res prior (unused by VelocityUNet), predict the noise (with t=1) and return the denoised image.
+    """
+    model.eval()
+    with torch.no_grad():
+        batch_size = x1.size(0)
+        t = torch.ones(batch_size, device=device, dtype=torch.long)
+        # For VelocityUNet, call forward with x1 and t only
+        predicted_noise = model(x1, t)
+        # Inversion: x0_pred = sqrt(alpha_bar)*x1 - sqrt(1-alpha_bar)*predicted_noise.
+        alpha_bar = alpha_bar.to(device)
+        sqrt_alpha_bar = math.sqrt(alpha_bar)
+        sqrt_one_minus_alpha_bar = math.sqrt(1 - alpha_bar)
+        x0_pred = sqrt_alpha_bar * x1 - sqrt_one_minus_alpha_bar * predicted_noise
+    return x0_pred
+
+#############################################
+# Iterative Refinement Function
+#############################################
+def iterative_denoise_conditional(model, x1, high_res_prior, iterations=3, device="cuda"):
+    """
+    Iteratively apply the one-step conditional denoiser.
+    x1: initial noisy image.
+    iterations: number of iterative refinement steps (experiment between 1 and 8).
+    Returns the final refined image.
+    """
+    model.eval()
+    x_iter = x1.clone().to(device)
+    for i in range(iterations):
+        x_iter = denoise_one_step_conditional(model, x_iter, alpha_bar, high_res_prior, device=device)
+    return x_iter
+
+
