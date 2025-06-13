@@ -1,0 +1,581 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+#############################################
+# Helper: Time Embedding (unchanged)
+#############################################
+def get_timestep_embedding(timesteps, embedding_dim):
+    half_dim = embedding_dim // 2
+    emb = math.log(10000) / (half_dim - 1)
+    inv_freq = torch.exp(torch.arange(half_dim, device=timesteps.device) * -emb)
+    emb = timesteps.float().unsqueeze(1) * inv_freq.unsqueeze(0)
+    emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
+    if embedding_dim % 2 == 1:
+        emb = F.pad(emb, (0, 1))
+    return emb
+
+
+
+#############################################
+# (Optional) CORRELATION-AWARE CHANNEL ATTENTION
+#############################################
+class CorrAwareChannelAttention(nn.Module):
+    def __init__(self, in_channels, corr_index=2):
+        """
+        A per-pixel channel-attention that explicitly multiplies
+        the 1×1‐conv logits by (1 + corr_map), where corr_map is 
+        extracted from channel `corr_index`.
+        """
+        super().__init__()
+        self.conv1x1 = nn.Conv2d(in_channels, in_channels, kernel_size=1, bias=False)
+        self.corr_index = corr_index
+
+    def forward(self, x):
+        # x: (B, C, H, W), and x[:, corr_index, :, :] is the "corr" channel
+        logits = self.conv1x1(x)                         # (B, C, H, W)
+        corr_map = x[:, self.corr_index : self.corr_index+1, :, :]  # (B, 1, H, W)
+        logits = logits * (1.0 + corr_map)               # broadcast to (B, C, H, W)
+        attn   = torch.softmax(logits, dim=1)            # (B, C, H, W)
+        return x * attn
+
+
+#############################################
+# Attention Blocks
+#############################################
+class ChannelAttention(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        # Use 1x1 convolution for pixel-level attention weights
+        self.conv1x1 = nn.Conv2d(in_channels, in_channels, kernel_size=1, bias=False)
+    def forward(self, x):
+        # Compute attention weights per pixel along the channel dimension
+        attn = torch.softmax(self.conv1x1(x), dim=1)
+        return x * attn
+
+class CrossChannelAttention(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        # Use 1x1 convolution on the conditioning input for pixel-level attention weights
+        self.conv1x1 = nn.Conv2d(in_channels, in_channels, kernel_size=1, bias=False)
+    def forward(self, x, cond):
+        # Compute attention weights from the conditioning features per pixel
+        attn = torch.softmax(self.conv1x1(cond), dim=1)
+        return x * attn
+
+
+#############################################
+# Residual Block with Cross–Channel Attention
+#############################################
+class ResidualBlockWithCrossAttention(nn.Module):
+    def __init__(self, in_channels, out_channels, time_emb_dim, reduction=16, cond_channels=None):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.time_emb_proj = nn.Linear(time_emb_dim, out_channels)
+        self.activation = nn.ReLU()  # disable inplace
+
+        self.skip_conv = (nn.Conv2d(in_channels, out_channels, kernel_size=1)
+                          if in_channels != out_channels else None)
+
+        # Switch between CorrAwareChannelAttention or plain ChannelAttention:
+        # If you want the explicit correlation bias, use CorrAwareChannelAttention(out_channels, corr_index).
+        # Otherwise, just use ChannelAttention(out_channels).
+        self.channel_attention = CorrAwareChannelAttention(out_channels, corr_index=2)  
+        # If you prefer the network to learn correlation on its own:
+        # self.channel_attention = ChannelAttention(out_channels)
+
+        # Cross-channel attention (same as before)
+        self.cross_attention  = CrossChannelAttention(out_channels)
+
+        if cond_channels is None:
+            cond_channels = out_channels
+        self.cond_proj = (nn.Conv2d(cond_channels, out_channels, kernel_size=1)
+                          if cond_channels != out_channels else None)
+
+    def forward(self, x, t_emb, cond=None):
+        h = self.activation(self.conv1(x))
+        t_proj = self.time_emb_proj(t_emb).unsqueeze(-1).unsqueeze(-1)
+        h = h + t_proj
+        h = self.conv2(h)
+        h = self.channel_attention(h)
+
+        if cond is not None:
+            if self.cond_proj is not None:
+                cond = self.cond_proj(cond)
+            h = self.cross_attention(h, cond)
+
+        if self.skip_conv is not None:
+            x = self.skip_conv(x)
+        return self.activation(h + x)
+
+#############################################
+# Multi-Scale Prior Encoder
+#############################################
+class MultiScalePriorEncoder(nn.Module):
+    def __init__(self, in_channels=3, feature_channels=16, num_levels=3, kernel_size=3):
+        super().__init__()
+        self.num_levels = num_levels
+        self.convs = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(in_channels if i==0 else feature_channels, feature_channels, kernel_size=kernel_size, stride=2, padding=1),
+                nn.ReLU(inplace=True)
+            ) for i in range(num_levels)
+        ])
+    def forward(self, x):
+        features = []
+        for conv in self.convs:
+            x = conv(x)
+            print("prior x.shape", x.shape)  # Shape: (n, feature_channels, H/2^i, W/2^i)
+            features.append(x)
+        return features
+    
+
+#############################################
+# Inception Block (unchanged)
+#############################################
+class InceptionBlock(nn.Module):
+    def __init__(self, in_channels, branch_channels):
+        super().__init__()
+        # 1×1 branch
+        self.branch1 = nn.Conv2d(in_channels, branch_channels, kernel_size=1)
+        # 1×1 → 3×3 branch
+        self.branch2 = nn.Sequential(
+            nn.Conv2d(in_channels, branch_channels, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(branch_channels, branch_channels, kernel_size=3, padding=1)
+        )
+        # 1×1 → 3×3 → 3×3 branch
+        self.branch3 = nn.Sequential(
+            nn.Conv2d(in_channels, branch_channels, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(branch_channels, branch_channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(branch_channels, branch_channels, kernel_size=3, padding=1)
+        )
+
+    def forward(self, x):
+        b1 = self.branch1(x)
+        b2 = self.branch2(x)
+        b3 = self.branch3(x)
+        return torch.cat([b1, b2, b3], dim=1)
+
+
+
+#############################################
+# VelocityUNet WITH CORRELATION MAP
+#############################################
+class VelocityUNet(nn.Module):
+    def __init__(self, base_ch=64, time_dim=128):
+        super().__init__()
+        self.time_proj = nn.Linear(time_dim, time_dim)
+
+        # --- Now accept 3 channels: (noisy_ch0, noisy_ch1, corr_map) ---
+        self.down1 = nn.Sequential(
+            nn.Conv2d(3, base_ch, kernel_size=3, padding=1),
+            nn.ReLU()  # disable inplace
+        )
+        self.down2 = nn.Sequential(
+            nn.Conv2d(base_ch, base_ch*2, kernel_size=3, stride=2, padding=1),
+            nn.ReLU()  # disable inplace
+        )
+        self.down3 = nn.Sequential(
+            nn.Conv2d(base_ch*2, base_ch*4, kernel_size=3, stride=2, padding=1),
+            nn.ReLU()  # disable inplace
+        )
+
+        self.up1 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(base_ch*4, base_ch*2, kernel_size=3, padding=1),
+            nn.ReLU()  # disable inplace
+        )
+        self.up2 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(base_ch*2, base_ch, kernel_size=3, padding=1),
+            nn.ReLU()  # disable inplace
+        )
+
+        self.incep = InceptionBlock(2*base_ch, base_ch//2)
+        self.res_conv = nn.Conv2d(3*(base_ch//2), 2*base_ch, kernel_size=1)
+
+        self.res = ResidualBlockWithCrossAttention(
+            in_channels=2*base_ch,
+            out_channels=base_ch,
+            time_emb_dim=time_dim,
+            reduction=16,
+            cond_channels=base_ch
+        )
+
+        # Output 2 channels (velocity/noise prediction for the 2 original input channels)
+        self.head = nn.Conv2d(base_ch, 2, kernel_size=3, padding=1)
+        self.act  = nn.ReLU()  # disable inplace
+
+    def forward(self, x, t):
+        """
+        x: (B, 2, H, W) -- the two noisy channels
+        t: (B,)        -- the timestep (always 1 in one-step denoising)
+        """
+
+        # 1) BUILD CORRELATION MAP
+        corr = x[:, 0:1, :, :] * x[:, 1:2, :, :]  # (B,1,H,W)
+
+        # 2) CONCATENATE → (B,3,H,W)
+        x_input = torch.cat([x, corr], dim=1)
+
+        # 3) TIME EMBEDDING
+        t_emb = get_timestep_embedding(t, self.time_proj.in_features)  # (B, time_dim)
+        t_emb = self.time_proj(t_emb)                                  # (B, time_dim)
+
+        # 4) ENCODER
+        d1 = self.down1(x_input)    # (B, base_ch,   H,   W)
+        d2 = self.down2(d1)         # (B, 2*base_ch, H/2, W/2)
+        d3 = self.down3(d2)         # (B, 4*base_ch, H/4, W/4)
+
+        # 5) DECODER
+        u1 = self.act(self.up1(d3)) # (B, 2*base_ch, H/2, W/2)
+        u2 = self.act(self.up2(u1)) # (B, base_ch,   H,   W)
+
+        # 6) SKIP + INCEPTION RESIDUAL
+        cat = torch.cat([d1, u2], dim=1)                    # (B, 2*base_ch, H, W)
+        residue = self.incep(cat)                           # (B, 3*(base_ch//2), H, W)
+        residue = self.res_conv(residue)                    # (B, 2*base_ch, H, W)
+        cat = cat + residue                                 # (B, 2*base_ch, H, W)
+
+        # 7) FINAL RESIDUAL BLOCK (t_emb injected, cond=None)
+        out = self.res(cat, t_emb, cond=None)                # (B, base_ch, H, W)
+
+        # 8) HEAD → 2 channels
+        return self.head(out)                                # (B, 2, H, W)
+
+#############################################
+# Discriminator (Patch-GAN)
+#############################################
+class PatchDiscriminator(nn.Module):
+    def __init__(self, in_ch=2, base=64):
+        super().__init__()
+        def blk(cin, cout, s):
+            return nn.Sequential(
+                nn.Conv2d(cin, cout, 4, stride=s, padding=1),
+                nn.LeakyReLU(0.2, True)
+            )
+        self.net = nn.Sequential(
+            blk(in_ch,     base,   2),
+            blk(base,      base*2, 2),
+            blk(base*2,    base*4, 2),
+            nn.Conv2d(base*4, 1, 4, padding=1)  # logits
+        )
+    def forward(self, x):
+        return self.net(x)
+
+
+#############################################
+# VGG perceptual helper  (conv1_2 + conv2_2)
+#############################################
+from torchvision.models import vgg16
+
+_vgg_feat = vgg16(weights="DEFAULT").features.eval()
+for p in _vgg_feat.parameters(): p.requires_grad = False
+def perceptual_L1(x, y):
+    # expects 3-channel RGB in 0..1; convert if grey-scale
+    if x.shape[1] == 1:
+        x = x.repeat(1,3,1,1)
+        y = y.repeat(1,3,1,1)
+    # ensure _vgg_feat is on the same device as x
+    vgg_model = _vgg_feat.to(x.device)
+    feats = []
+    curx, cury = x, y
+    for i, layer in vgg_model._modules.items():
+        curx = layer(curx); cury = layer(cury)
+        if i in {"3", "8"}:   # relu1_2, relu2_2
+            feats.append(F.l1_loss(curx, cury))
+        if i == "8": break
+    return sum(feats)
+
+
+#############################################
+# Laplacian consistency  (|Δx0_pred – Δx0|)
+#############################################
+_lap_kernel = torch.tensor([[0,  1, 0],
+                            [1, -4, 1],
+                            [0,  1, 0]], dtype=torch.float32).view(1,1,3,3)
+def laplacian(img):
+    k = _lap_kernel.to(img.device)
+    ch = img.shape[1]
+    k = k.repeat(ch,1,1,1)
+    return F.conv2d(img, k, padding=1, groups=ch)
+
+##############################################
+# Prior Downsampling (similar to eDR)
+##############################################
+def generate_prior_ds(prior_hr, x0_hat, device="cuda"):
+    """
+    Downsample each high-res channel via downsampling_thro_conv2,
+    then pad/crop each crop to match x0_hat size before stacking.
+    prior_hr: (N, c, H, W), x0_hat: (N, ?, h, w)
+    Returns: Tensor (N, c * num_samples, h, w)
+    """
+    import torch, numpy as np
+    N, c, H, W = prior_hr.shape
+    _, _, h, w = x0_hat.shape
+    ds = H // h
+    outputs = []
+
+    for n in range(N):
+        ch_blocks = []
+        for ch in range(c):
+            lr_list, _ = downsampling_thro_conv2(
+                prior_hr[n, ch].cpu().numpy(),
+                sumfilter=1, binning=1, downsample_factor=ds
+            )
+            resized = []
+            for arr in lr_list:
+                ah, aw = arr.shape
+                # crop if larger
+                if ah > h:
+                    start = (ah - h) // 2
+                    arr = arr[start:start+h, :]
+                if aw > w:
+                    start = (aw - w) // 2
+                    arr = arr[:, start:start+w]
+                # pad if smaller
+                pad_h = max(0, h - arr.shape[0])
+                pad_w = max(0, w - arr.shape[1])
+                if pad_h or pad_w:
+                    ph = pad_h // 2
+                    pw = pad_w // 2
+                    arr = np.pad(arr,
+                                 ((ph, pad_h-ph), (pw, pad_w-pw)),
+                                 mode='constant', constant_values=0)
+                    # normalize to [0, 1]
+                    arr = arr / (np.max(arr) + 1e-8)
+                resized.append(torch.from_numpy(arr))
+            ch_blocks.append(torch.stack(resized, dim=0))
+        outputs.append(torch.cat(ch_blocks, dim=0))
+    return torch.stack(outputs, dim=0)
+
+#############################################
+# shift MSE loss
+
+def shifted_mse_loss(image1, image2):
+    """
+    For each sample n, compute the MSE loss between the first channel of image1[n] and each channel of image2[n].
+    For a given channel, iterate over all 3×3 shifts and return the average sample loss.
+    """
+    N, C, H, W = image1.shape
+    sample_losses = []
+    sample_losses_index = []
+    for n in range(N):
+        m_losses = []
+        base = image1[n, 0, :, :]
+        # detach the tensor before converting to numpy in centerimage
+        base = centerimage(base.detach())
+        for m in range(image2.shape[1]):
+            min_loss = None
+            for shift_y in [-1, 0, 1]:
+                for shift_x in [-1, 0, 1]:
+                    if shift_x >= 0:
+                        x1_start = shift_x
+                        crop_W = W - shift_x
+                    else:
+                        x1_start = 0
+                        crop_W = W + shift_x
+                    if shift_y >= 0:
+                        y1_start = shift_y
+                        crop_H = H - shift_y
+                    else:
+                        y1_start = 0
+                        crop_H = H + shift_y
+                    if crop_W <= 0 or crop_H <= 0:
+                        continue
+                    shifted_region = base[y1_start:y1_start+crop_H, x1_start:x1_start+crop_W]
+                    region_image2 = image2[n, m, 0:crop_H, 0:crop_W]
+                    region_image2 = centerimage(region_image2)
+                    # to tensor
+                    shifted_region = torch.tensor(shifted_region, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+                    region_image2 = torch.tensor(region_image2, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+                    loss = F.mse_loss(shifted_region, region_image2, reduction='mean')
+                    if min_loss is None or loss < min_loss:
+                        min_loss = loss
+            m_losses.append(min_loss)
+        sample_losses.append(min(m_losses))
+        # Store the index of the channel that gave the minimum loss
+        min_index = np.argmin(m_losses)
+        sample_losses_index.append(min_index)
+        
+    return torch.stack(sample_losses).mean()
+##############################################
+
+#############################################
+# Updated Training Pipeline for One-Step Conditional Denoising with fixed mini-batch size = 32
+def train_one_step(model, D, dataloader,
+                   epochs, image_size, alpha_bar, mu_range, sigma_range,
+                   λ_col, λ_prior, λ_perc, λ_gan, λ_lap,
+                   device, val_dataloader=None):
+    import pandas as pd  # ...existing imports...
+    loss_log = []  # initialize loss log
+    
+    batch_size = 32  # fixed mini-batch size
+    G_opt = torch.optim.Adam(model.parameters(), lr=2e-4, betas=(0.5,0.999))
+    D_opt = torch.optim.Adam(D.parameters(),     lr=2e-4, betas=(0.5,0.999))
+
+    sqrt_ab   = math.sqrt(alpha_bar)
+    sqrt_1ab  = math.sqrt(1-alpha_bar)
+    model.train();  D.train()
+
+    # generate 1 time prior_ds #######
+    c= [0,2,4]  # channels to use for prior_ds
+    prior_hr_1 = dataloader[0][3][0:batch_size,c,:,:]  # assuming prior_hr is the 4th item in the dataset tuple
+    print("prior_hr_1.shape", prior_hr_1.shape)  # should be (N, c, h, w)
+    x0_hat_1 = dataloader[0][0][0:batch_size,:,:,:]  # assuming x0 is the 1st item in the dataset tuple
+    prior_ds = generate_prior_ds(prior_hr_1, x0_hat_1, device=device)
+    print("prior_ds.shape", prior_ds.shape)  # should be (N, c * num_samples, h, w)
+    # save prior_ds tensor as pytorch file
+    prior_ds = prior_ds.to(device)  # move to device
+    torch.save(prior_ds, 'prior_ds.pth')  # save for later use
+
+    ##################################
+
+
+    for epoch in tqdm(range(epochs), desc="Epochs"):
+        # --- Training Loop -------------------------------------------
+        for full_x0, full_x1, full_noise, full_prior in dataloader:
+            total_samples = full_x0.shape[0]
+            for start in tqdm(range(0, total_samples, batch_size), desc="Mini-batches", leave=False):
+                x0 = full_x0[start:start+batch_size].to(device)
+                x1 = full_x1[start:start+batch_size].to(device)
+                noise = full_noise[start:start+batch_size].to(device)
+                prior_hr = full_prior[start:start+batch_size].to(device)
+                current_bs = x0.shape[0]
+                t = torch.ones(current_bs, device=device, dtype=torch.long)
+                
+                # x1 and noise are pre-generated and loaded from dataloader
+                
+                with torch.no_grad():
+                    v_pred = model(x1, t)
+                    x0_hat = sqrt_ab * x1 - sqrt_1ab * v_pred
+
+                x0_p = x0[:, 0:1, :, :]  # focus on 1st channel of x0
+                x0_hat_p = x0_hat[:, 0:1, :, :]
+                D_real = D(x0_p);  D_fake = D(x0_hat_p)
+                loss_D = (F.relu(1.-D_real).mean() + F.relu(1.+D_fake).mean())
+                D_opt.zero_grad(); loss_D.backward(); D_opt.step()
+                
+                v_pred = model(x1, t)
+                # Inversion: corrected to use x1 instead of x0
+                x0_hat = sqrt_ab * x1 + (- sqrt_1ab) * v_pred
+                v_true = sqrt_ab * noise - sqrt_1ab * x0
+                x0_hat_p = x0_hat[:, 0:1, :, :]  # focus on 1st channel of x0_hat
+
+                loss_gan = -D(x0_hat_p).mean()
+                # focus on 1st (W1 channel):  loss about V map 
+                v_pred_1 = v_pred[:, 0:1, :, :]
+                v_true_1 = v_true[:, 0:1, :, :]
+                loss_mse = F.mse_loss(v_pred_1, v_true_1)
+                loss_col = F.mse_loss(v_pred_1, v_pred_1.mean(2, keepdim=True))
+
+                # focus on 1st channel of prior_hr:  loss about prior feature 
+                c = [0,2,4]
+                prior_hr_1 = prior_hr[:, c, :, :]
+                x0_hat_1 = x0_hat[:, 0:1, :, :]
+                #prior_ds = generate_prior_ds(prior_hr_1, x0_hat_1, device=device)
+                loss_prior = shifted_mse_loss(x0_hat_1, prior_ds)
+                
+                #   perceptual & laplacian of x0_hat and x0 using 1st channel only:  loss about x0 (clean image)
+                x0_1     = x0[:, 0:1, :, :]
+                loss_perc = perceptual_L1(x0_hat_1.clamp(0,1), x0_1.clamp(0,1))
+                loss_lap  = F.l1_loss(laplacian(x0_hat_1), laplacian(x0_1))
+                loss_G = (loss_mse
+                          + λ_col*loss_col
+                          + λ_prior*loss_prior
+                          + λ_perc*loss_perc
+                          + λ_lap*loss_lap
+                          + λ_gan*loss_gan)
+                
+                G_opt.zero_grad(); loss_G.backward(); G_opt.step()
+                print(f"Epoch {epoch+1}/{epochs} - processed {start+current_bs}/{total_samples} samples - ")
+        # --- Validation Loop (if provided) -------------------------
+        if val_dataloader is not None:
+            model.eval()
+            val_losses = []
+            with torch.no_grad():
+                for full_x0, full_x1, full_noise, full_prior in val_dataloader:
+                    total_samples = full_x0.shape[0]
+                    for start in tqdm(range(0, total_samples, batch_size), desc="Val Mini-batches", leave=False):
+                        x0 = full_x0[start:start+batch_size].to(device)
+                        x1 = full_x1[start:start+batch_size].to(device)
+                        noise = full_noise[start:start+batch_size].to(device)
+                        prior_hr = full_prior[start:start+batch_size].to(device)
+                        current_bs = x0.shape[0]
+                        t = torch.ones(current_bs, device=device, dtype=torch.long)
+                        
+                        v_pred = model(x1, t)
+                        x0_hat = sqrt_ab * x1 - sqrt_1ab * v_pred
+                        v_true = sqrt_ab * noise - sqrt_1ab * x0
+                        v_pred_1 = v_pred[:, 0:1, :, :]
+                        v_true_1 = v_true[:, 0:1, :, :]
+                        loss_mse = F.mse_loss(v_pred_1, v_true_1)
+                        loss_col = F.mse_loss(v_pred_1, v_pred_1.mean(2, keepdim=True))
+                        c = [0,2,4]
+                        prior_hr_1 = prior_hr[:, c, :, :]
+                        x0_hat_1 = x0_hat[:, 0:1, :, :]
+                        #prior_ds = generate_prior_ds(prior_hr_1, x0_hat_1, device=device)
+                        loss_prior = shifted_mse_loss(x0_hat_1, prior_ds)
+                        loss_gan = -D(x0_hat_1).mean()
+                        x0_1 = x0[:, 0:1, :, :]
+                        loss_perc = perceptual_L1(x0_hat_1.clamp(0,1), x0_1.clamp(0,1))
+                        loss_lap = F.l1_loss(laplacian(x0_hat_1), laplacian(x0_1))
+                        loss_G_val = (loss_mse + λ_col*loss_col + λ_prior*loss_prior +
+                                      λ_perc*loss_perc + λ_lap*loss_lap + λ_gan*loss_gan)
+                        val_losses.append(loss_G_val.item())
+            avg_val_loss = sum(val_losses)/len(val_losses) if val_losses else 0.0
+            print(f"Epoch {epoch+1}/{epochs} - Training Loss: {loss_G.item():.6f} | Validation Loss: {avg_val_loss:.6f}")
+            model.train()
+        else:
+            avg_val_loss = None
+            print(f"Epoch {epoch+1}/{epochs} - Training Loss: {loss_G.item():.6f}")
+        
+        # save model checkpoint every 100 epochs and record loss to excel
+        if (epoch+1) % 100 == 0:
+            torch.save(model.state_dict(), f"c:\\Users\\pwang\\OneDrive - KLA Corporation\\Desktop\\Notebook\\denoise\\model_epoch_{epoch+1}.pth")
+            loss_record = {"epoch": epoch+1,
+                           "training_loss": loss_G.item(),
+                           "validation_loss": avg_val_loss}
+            loss_log.append(loss_record)
+            pd.DataFrame(loss_log).to_excel("c:\\Users\\pwang\\OneDrive - KLA Corporation\\Desktop\\Notebook\\denoise\\loss_log.xlsx", index=False)
+            
+#############################################
+# Inference Pipeline: One-Step Conditional Denoising
+#############################################
+def denoise_one_step_conditional(model, x1, alpha_bar, high_res_prior, device="cuda"):
+    """
+    Given a noisy image x1 and a high-res prior (unused by VelocityUNet), predict the noise (with t=1) and return the denoised image.
+    """
+    model.eval()
+    with torch.no_grad():
+        batch_size = x1.size(0)
+        t = torch.ones(batch_size, device=device, dtype=torch.long)
+        # For VelocityUNet, call forward with x1 and t only
+        predicted_noise = model(x1, t)
+        # Inversion: x0_pred = sqrt(alpha_bar)*x1 - sqrt(1-alpha_bar)*predicted_noise.
+        sqrt_alpha_bar = math.sqrt(alpha_bar)
+        sqrt_one_minus_alpha_bar = math.sqrt(1 - alpha_bar)
+        x0_pred = sqrt_alpha_bar * x1 - sqrt_one_minus_alpha_bar * predicted_noise
+    return x0_pred
+
+#############################################
+# Iterative Refinement Function
+#############################################
+def iterative_denoise_conditional(model, x1, alpha_bar, high_res_prior, iterations=3, device="cuda"):
+    """
+    Iteratively apply the one-step conditional denoiser.
+    x1: initial noisy image.
+    iterations: number of iterative refinement steps (experiment between 1 and 8).
+    Returns the final refined image.
+    """
+    model.eval()
+    x_iter = x1.clone().to(device)
+    for i in range(iterations):
+        x_iter = denoise_one_step_conditional(model, x_iter, alpha_bar, high_res_prior, device=device)
+    return x_iter
+
