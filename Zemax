@@ -1,0 +1,65 @@
+###############################################################################
+# 213 nm dummy chain with explicit pupil/field tags
+###############################################################################
+import clr, os, sys
+sys.path.append(r"C:\Program Files\Zemax OpticStudio\ZOS-API\Libraries")
+import ZOSAPI
+
+zosapi = ZOSAPI.ZOSAPI_Connection()
+app     = zosapi.ConnectAsExtension(0)
+sys     = app.PrimarySystem
+sys.MakeSequential()
+
+# ---- GLOBAL DATA -----------------------------------------------------------
+sys.SystemData.Wavelengths.GetWavelength(1).Wavelength = 0.213   # µm
+sys.SystemData.Aperture.ApertureType  = ZOSAPI.SystemData.ApertureTypes.EntrancePupilDiameter
+sys.SystemData.Aperture.ApertureValue = 22.0                     # 2× stop radius
+
+LDE = sys.LDE
+
+def surf(i, **kw):                   # helper to add / edit one surface
+    while LDE.NumberOfSurfaces <= i:
+        LDE.AddSurface()
+    s = LDE.GetSurfaceAt(i)
+    for k,v in kw.items():
+        setattr(s, k, v)
+    return s
+
+# OBJECT + STOP --------------------------------------------------------------
+surf(0).Comment = "OBJECT @ ∞"
+surf(1, Comment="STOP – ENTRANCE PUPIL", Radius=-30, Thickness=5,
+     Material="CaF2", SemiDiameter=11);  LDE.GetSurfaceAt(1).MakeStop()
+surf(2, Comment="Objective back", Radius=30, Thickness=10, SemiDiameter=11)
+
+# --------------------------  AFO  -------------------------------------------
+surf(3, Comment="AFO L1 front",  Radius=-25, Thickness=5,  Material="CaF2", SemiDiameter=12)
+surf(4, Comment="AFO L1 back",   Radius= 25, Thickness=12.5, SemiDiameter=12)
+
+surf(5, Comment="AFO FIELD PLANE", Radius=0, Thickness=12.5, SemiDiameter=12)   # tag only
+
+surf(6, Comment="AFO PUPIL PLANE / AFO L2 front", Radius=-25, Thickness=5,
+     Material="CaF2", SemiDiameter=12)
+surf(7, Comment="AFO L2 back",    Radius=25, Thickness=10, SemiDiameter=12)
+
+# --------------------------  PPR1 -------------------------------------------
+surf(8,  Comment="PPR1 L1 front", Radius=-30, Thickness=5,  Material="CaF2", SemiDiameter=12)
+surf(9,  Comment="PPR1 L1 back",  Radius= 30, Thickness=20, SemiDiameter=12)
+
+surf(10, Comment="PPR1 FIELD PLANE", Radius=0, Thickness=20, SemiDiameter=12)   # tag only
+
+surf(11, Comment="PPR1 PUPIL PLANE / PPR1 L2 front", Radius=-30, Thickness=5,
+     Material="CaF2", SemiDiameter=12)
+surf(12, Comment="PPR1 L2 back", Radius=30, Thickness=20, SemiDiameter=12)
+
+# --------------------------  W1 Tube -----------------------------------------
+surf(13, Comment="W1 Tube front", Radius=-50, Thickness=5, Material="CaF2", SemiDiameter=14)
+surf(14, Comment="EXIT PUPIL (approx.)", Radius=0, Thickness=35, SemiDiameter=14)  # tag
+surf(15, Comment="W1 Tube back",  Radius=50, Thickness=40, SemiDiameter=14)
+
+# IMAGE -----------------------------------------------------------------------
+surf(16, Comment="IMAGE", Radius=0, Thickness=0); sys.LDE.GetSurfaceAt(16).SolveGroup = 0
+
+# SAVE ------------------------------------------------------------------------
+out = r"C:\Temp\dummy_213nm_with_pupil_tags.zmx"
+sys.SaveAs(out)
+print("Saved ➜", out)
