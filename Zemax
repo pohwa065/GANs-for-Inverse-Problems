@@ -63,3 +63,58 @@ surf(16, Comment="IMAGE", Radius=0, Thickness=0); sys.LDE.GetSurfaceAt(16).Solve
 out = r"C:\Temp\dummy_213nm_with_pupil_tags.zmx"
 sys.SaveAs(out)
 print("Saved ➜", out)
+
+import os, sys, clr, winreg
+
+# 1.  Locate OpticStudio via the registry (works for 2024 R2 +):
+with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+        r"SOFTWARE\Zemax\OpticStudio") as hk:
+    install_dir, _ = winreg.QueryValueEx(hk, "InstallDir")
+
+# 2.  Append the API's library folder
+api_dir = os.path.join(install_dir, "ZOS-API", "Libraries")
+sys.path.append(api_dir)
+
+# 3.  Load the assemblies
+clr.AddReference("ZOSAPI")          # main interface
+clr.AddReference("ZOSAPI_Interfaces")
+import ZOSAPI
+
+
+# --- boiler-plate above already executed ---
+conn   = ZOSAPI.ZOSAPI_Connection()
+app    = conn.CreateNewApplication()      # launches a hidden OpticStudio
+if app is None or not app.IsValidLicense():
+    raise RuntimeError("No OpticStudio license found")
+sysobj = app.PrimarySystem                # the open lens file
+
+# Example: build a one-surface dummy lens
+sysobj.LDE.InsertSurfaceAt(1)             # adds a second surface
+surf1 = sysobj.LDE.GetSurfaceAt(1)
+surf1.Comment  = "Dummy objective"
+surf1.Radius   = 50
+surf1.Thickness= 5
+# Run a quick spot diagram
+spot = sysobj.Analyses.New_Analysis(ZOSAPI.Analysis.AnalysisIDM.SpotDiagram)
+spot.ApplyAndWaitForCompletion()
+print("RMS spot (µm):", spot.GetResults().SpotData.RMS) 
+
+app.CloseApplication()
+
+
+import zospy as zp
+
+zos = zp.ZOS()           # loads the assemblies
+oss = zos.connect()      # default = standalone
+sysobj = oss.system      # OpticStudioSystem wrapper
+
+# System helpers: oss.lde, oss.nce, oss.analyses, ...
+sysobj.lde.insert_surface()            # convenience shortcut
+sysobj.lde[1].radius = 50
+rms = oss.analyses.spot_diagram().results.rms
+print(rms)
+
+
+import zospy as zp
+zos = zp.ZOS()
+oss = zos.connect("extension")      # attaches to the running GUI
