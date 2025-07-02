@@ -1,1 +1,190 @@
+import torch
+import torch.nn as nn
+import torch.fft
+import numpy as np
+import math
+
+# --- Utility and Helper Functions (create_grid, propagate_fresnel_pytorch are the same as above) ---
+
+def create_grid(H, W, dx_m, device='cpu'):
+    """
+    Creates spatial and frequency grids.
+    """
+    if isinstance(dx_m, float):
+        dy_m = dx_m
+    else:
+        dy_m, dx_m = dx_m
+    x = torch.arange(-W // 2, W // 2, device=device) * dx_m
+    y = torch.arange(-H // 2, H // 2, device=device) * dy_m
+    y_coords, x_coords = torch.meshgrid(y, x, indexing='ij')
+    fx_cycles_sample = torch.fft.fftfreq(W, d=1.0, device=device)
+    fy_cycles_sample = torch.fft.fftfreq(H, d=1.0, device=device)
+    fy_coords_mesh, fx_coords_mesh = torch.meshgrid(fy_cycles_sample, fx_cycles_sample, indexing='ij')
+    fy_coords_phys_mesh = fy_coords_mesh / dy_m
+    fx_coords_phys_mesh = fx_coords_mesh / dx_m
+    return x_coords, y_coords, fx_coords_phys_mesh, fy_coords_phys_mesh
+
+def propagate_fresnel_pytorch(input_field_n1hw, dx_m, dist_m, wavelength_m):
+    """
+    Fresnel propagation for a single polarization component (N, 1, H, W).
+    """
+    N, C, H, W = input_field_n1hw.shape
+    device = input_field_n1hw.device
+    if C != 1:
+        raise ValueError("propagate_fresnel_pytorch expects input_field_n1hw with C=1")
+    input_field = input_field_n1hw.squeeze(1)
+    if isinstance(dx_m, float): dy_m_in, dx_m_in = dx_m, dx_m
+    else: dy_m_in, dx_m_in = dx_m
+    x_coords_in, y_coords_in, fx_coords_prop, fy_coords_prop = create_grid(H, W, (dy_m_in, dx_m_in), device=device)
+    quad_phase_factor_in = torch.exp(
+        1j * torch.pi / (wavelength_m * dist_m) * (x_coords_in**2 + y_coords_in**2)
+    ).unsqueeze(0)
+    U_prime = input_field * quad_phase_factor_in
+    G = torch.fft.fft2(U_prime, norm='ortho')
+    propagator_freq = torch.exp(
+        1j * torch.pi * wavelength_m * dist_m * (fx_coords_prop**2 + fy_coords_prop**2)
+    ).unsqueeze(0)
+    Result_freq = G * propagator_freq
+    U_sensor_scaled = torch.fft.ifft2(Result_freq, norm='ortho')
+    final_scaling_phase = torch.exp(1j * 2 * torch.pi * dist_m / wavelength_m) / \
+                          (1j * wavelength_m * dist_m)
+    output_field = U_sensor_scaled * final_scaling_phase
+    return output_field.unsqueeze(1)
+
+
+# --- Optical System Module ---
+class FreeformPhasePlateOptimizerPolarizedPT(nn.Module):
+    def __init__(self, params):
+        super().__init__()
+        self.params = params
+        self.device = params.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
+
+        self.wavelength_m = params['wavelength_m']
+        self.pupil_diameter_m = params['pupil_diameter_m']
+        self.propagation_distance_m = params['propagation_distance_m']
+        self.grid_size_h = params['grid_size_h']
+        self.grid_size_w = params['grid_size_w']
+        
+        self.pupil_sample_dy_m = self.pupil_diameter_m / self.grid_size_h
+        self.pupil_sample_dx_m = self.pupil_diameter_m / self.grid_size_w
+
+        initial_phase = torch.zeros((self.grid_size_h, self.grid_size_w), device=self.device)
+        self.learnable_phase_hw = nn.Parameter(initial_phase)
+
+        y = torch.linspace(-self.grid_size_h // 2, self.grid_size_h // 2 -1, self.grid_size_h, device=self.device) * self.pupil_sample_dy_m
+        x = torch.linspace(-self.grid_size_w // 2, self.grid_size_w // 2 -1, self.grid_size_w, device=self.device) * self.pupil_sample_dx_m
+        Y, X = torch.meshgrid(y, x, indexing='ij')
+        R_sq = X**2 + Y**2
+        pupil_radius_sq = (self.pupil_diameter_m / 2)**2
+        aperture_mask = (R_sq <= pupil_radius_sq).float() # Shape (H,W)
+        self.register_buffer('aperture_mask_hw', aperture_mask) # (H,W)
+
+    def forward(self, input_E_complex_n2hw):
+        """
+        Args:
+            input_E_complex_n2hw (torch.Tensor): Input complex E-field (N, 2, H, W).
+                                                Channel 0 for Ex, Channel 1 for Ey.
+        """
+        if input_E_complex_n2hw.shape[1] != 2:
+            raise ValueError("Input E-field must have 2 channels (Ex, Ey).")
+
+        Ex_pupil_n1hw = input_E_complex_n2hw[:, 0:1, :, :]
+        Ey_pupil_n1hw = input_E_complex_n2hw[:, 1:2, :, :]
+
+        # 1. Get the learnable phase (scalar phase shift)
+        phase_shift_11hw = self.learnable_phase_hw.unsqueeze(0).unsqueeze(0)
+
+        # 2. Apply phase shift independently to Ex and Ey
+        Ex_pupil_out_n1hw = Ex_pupil_n1hw * torch.exp(1j * phase_shift_11hw)
+        Ey_pupil_out_n1hw = Ey_pupil_n1hw * torch.exp(1j * phase_shift_11hw)
+        
+        # 3. Apply aperture mask independently
+        # aperture_mask_hw is (H,W), unsqueeze to (1,1,H,W) for broadcasting
+        aperture_mask_11hw = self.aperture_mask_hw.unsqueeze(0).unsqueeze(0)
+        Ex_apertured_n1hw = Ex_pupil_out_n1hw * aperture_mask_11hw
+        Ey_apertured_n1hw = Ey_pupil_out_n1hw * aperture_mask_11hw
+
+        # 4. Propagate Ex and Ey independently
+        dx_m_tuple = (self.pupil_sample_dy_m, self.pupil_sample_dx_m)
+        Ex_sensor_n1hw = propagate_fresnel_pytorch(
+            Ex_apertured_n1hw, dx_m_tuple, self.propagation_distance_m, self.wavelength_m
+        )
+        Ey_sensor_n1hw = propagate_fresnel_pytorch(
+            Ey_apertured_n1hw, dx_m_tuple, self.propagation_distance_m, self.wavelength_m
+        )
+
+        # 5. Calculate PSF for each component and sum them
+        psf_Ex_n1hw = torch.abs(Ex_sensor_n1hw)**2
+        psf_Ey_n1hw = torch.abs(Ey_sensor_n1hw)**2
+        
+        total_psf_n1hw = psf_Ex_n1hw + psf_Ey_n1hw # Resulting PSF is (N, 1, H, W)
+
+        return total_psf_n1hw
+
+# --- Example Custom Loss Function (remains the same) ---
+def example_psf_loss(psf_n1hw, target_psf_n1hw=None):
+    if target_psf_n1hw is not None:
+        return torch.mean((psf_n1hw - target_psf_n1hw)**2)
+    else:
+        N, C, H, W = psf_n1hw.shape
+        psf_peaks = torch.amax(psf_n1hw.view(N, -1), dim=1)
+        return -torch.mean(psf_peaks)
+
+# --- Main Training Loop Example ---
+if __name__ == '__main__':
+    print("PyTorch Freeform Phase Plate Optimizer (Polarized Input) Prototyping")
+    params = {
+        'wavelength_m': 550e-9,
+        'pupil_diameter_m': 5e-3,
+        'propagation_distance_m': 50e-3,
+        'grid_size_h': 32, # Even smaller grid for freeform demo
+        'grid_size_w': 32,
+        'device': 'cuda' if torch.cuda.is_available() else 'cpu',
+        'learning_rate': 5e-4, # May need different LR for freeform
+        'num_epochs': 50,
+        'batch_size': 2,
+    }
+    print(f"Using device: {params['device']}")
+    model = FreeformPhasePlateOptimizerPolarizedPT(params).to(params['device'])
+    optimizer = torch.optim.Adam(model.parameters(), lr=params['learning_rate'])
+
+    # Example dummy input E-field data (N, 2, H, W) - same as Zernike example
+    pupil_sample_dy = params['pupil_diameter_m'] / params['grid_size_h']
+    pupil_sample_dx = params['pupil_diameter_m'] / params['grid_size_w']
+    y_p = (torch.arange(params['grid_size_h'], device=params['device']) - params['grid_size_h'] // 2) * pupil_sample_dy
+    x_p = (torch.arange(params['grid_size_w'], device=params['device']) - params['grid_size_w'] // 2) * pupil_sample_dx
+    Y_p, X_p = torch.meshgrid(y_p, x_p, indexing='ij')
+    w0_ex = (params['pupil_diameter_m'] / 2) * 0.4
+    amp_ex = torch.exp(-(X_p**2 + Y_p**2) / (w0_ex**2))
+    phase_ex = torch.zeros_like(amp_ex)
+    E_complex_ex = amp_ex * torch.exp(1j * phase_ex)
+    w0_ey = (params['pupil_diameter_m'] / 2) * 0.5
+    amp_ey = torch.exp(-(X_p**2 + Y_p**2) / (w0_ey**2))
+    phase_ey = (X_p / (params['pupil_diameter_m']/2)) * torch.pi
+    E_complex_ey = amp_ey * torch.exp(1j * phase_ey)
+    single_E_field_12hw = torch.stack([E_complex_ex, E_complex_ey], dim=0).unsqueeze(0)
+    dummy_input_E_batch_n2hw = single_E_field_12hw.repeat(params['batch_size'], 1, 1, 1).to(params['device'])
+
+    print(f"Input E-field batch shape: {dummy_input_E_batch_n2hw.shape}")
+    print(f"Shape of learnable phase plate: {model.learnable_phase_hw.shape}")
+
+    for epoch in range(params['num_epochs']):
+        model.train()
+        psf_output_n1hw = model(dummy_input_E_batch_n2hw)
+        loss = example_psf_loss(psf_output_n1hw)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        if (epoch + 1) % 10 == 0 or epoch == 0:
+            print(f"Epoch [{epoch+1}/{params['num_epochs']}], Loss: {loss.item():.6e}")
+
+    print("Training finished.")
+    # import matplotlib.pyplot as plt
+    # learned_phase = model.learnable_phase_hw.data.cpu().numpy()
+    # plt.imshow(learned_phase, cmap='twilight_shifted'); plt.colorbar(); plt.title("Freeform Learned Phase"); plt.show()
+    # model.eval()
+    # with torch.no_grad():
+    #    final_psf = model(dummy_input_E_batch_n2hw[0:1,...])
+    #    plt.imshow(final_psf.squeeze().cpu().numpy()); plt.colorbar(); plt.title("Freeform Optimized PSF (Ex^2+Ey^2)"); plt.show()
+
 
