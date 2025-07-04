@@ -1,0 +1,167 @@
+################################################
+# filename: bsdf_calculation.lsf
+#
+# Description: This file calculates the BRDF and
+# BTDF for a given surface. It should be run
+# with the fsp file bsdf_simple_bloch.fsp.
+#  
+# Copyright 2014 Lumerical Solutions Inc
+################################################
+
+################################################
+# user defined parameters and choices
+run_simulations = 1; #1 for true, 0 for false
+run_analysis = 1; #1 for true, 0 for false
+
+theta = linspace(0,60,5);   # sweep over different angles of incidence
+phi = linspace(0,90,2);     # sweep over two orientations of the rough surface. Here we are rotating the structure by 90 deg, but equivalently we could change the source angle phi.  Rotating the structure just happens to make the analysis easier in this situation.
+randSeedVals = 100:109;     # 10 different seeds, to generate 10 different random surfaces
+x0 = linspace(-5e-6,5e-6,3);
+y0 = linspace(-5e-6,5e-6,3);
+theta_out = linspace(-85,85,100);
+phi_out = 0;
+measurement_half_angle = 5; # in degrees
+data_filename = "bsdf_final";
+################################################
+
+################################################
+# run the simulation, if desired
+if(run_simulations) {
+  simcount = 0;
+  for(i=1:length(theta)) {           # sweep over angle of incidence
+   for(j=1:length(phi)) {            # sweep over surface orientation (0 or 90)
+    for(pol=0:90:90) {               # sweep over source polarization
+     for(k=1:length(randSeedVals)) { # sweep over different randomized rough surfaces
+      
+        switchtolayout;
+
+        select("source1");
+        set("angle theta",-theta(i));
+        set("polarization angle",pol);
+
+        select("rough_surf");
+        set("first axis","z");
+        set("rotation 1",phi(j));
+        set("seed",randSeedVals(k));
+      
+        simcount = simcount + 1;
+        save("bsdf_temp_bloch"+num2str(simcount));
+        addjob("bsdf_temp_bloch"+num2str(simcount));
+     } # seed value 
+    } #polarization
+   } #phi
+  } #theta
+
+  runjobs;
+} #run_simulations
+################################################
+
+
+
+################################################
+# run analysis, if desired
+if(run_analysis) {
+  BRDF = matrix(length(theta),length(theta_out),length(phi_out));
+  BTDF = matrix(length(theta),length(theta_out),length(phi_out));
+  spec_R = matrix(length(theta));
+  spec_T = matrix(length(theta));
+  total_power_R = matrix(length(theta));
+  total_power_T = matrix(length(theta));
+  simcount = 0;
+  for(i=1:length(theta)) {              # extract results for each angle of incidence
+
+   newangle = 1;
+   for(j=1:length(phi)) {               # average results over surface orientation (0 or 90)
+    for(pol=0:90:90) {                  # average results over source polarization
+     for(k=1:length(randSeedVals)) {    # average results over different randomized rough surfaces
+        simcount = simcount + 1;
+        load("bsdf_temp_bloch"+num2str(simcount));
+        ?"Analyzing simulation " + num2str(simcount) + " of " + num2str(length(theta)*length(phi)*2*length(randSeedVals));
+        runanalysis;
+        save;
+        if(newangle) {
+          newangle = 0;
+          E2_up = 0;   
+          E2_down = 0; 
+        }
+        BSDF_up   = getresult("BSDF","BSDF_up");
+        BSDF_down = getresult("BSDF","BSDF_down");
+        E2_up     = E2_up + BSDF_up.E2*(1+transmission("BSDF::up"));
+        E2_down   = E2_down + BSDF_down.E2*(-transmission("BSDF::down"));
+      } # randseed value
+    } #polarization
+    } #phi
+
+    ux_up   = BSDF_up.ux;      uy_up   = BSDF_up.uy;
+    ux_down = BSDF_down.ux;    uy_down = BSDF_down.uy;
+    n_up    = BSDF_up.n;       m_up   = BSDF_up.m;
+    n_down  = BSDF_down.n;     m_down = BSDF_down.m;
+    E2_up   = pinch(E2_up);    E2_down = pinch(E2_down);
+    
+    # normalize field amplitude by number of simulations run
+    N_samples = length(randSeedVals)*2*length(phi);
+    E2_up     = E2_up   / N_samples;  
+    E2_down   = E2_down / N_samples;
+    
+    # apply the symmetry with respect to the plane of incidence
+    if (true) {
+      E2_up     = 0.5*(E2_up(1:length(ux_up),length(uy_up):-1:1) + E2_up);
+      E2_down   = 0.5*(E2_down(1:length(ux_down),length(uy_down):-1:1) + E2_down);
+    }
+    
+    spec_R(i) = E2_up(find(n_up,0),find(m_up,0));
+    spec_T(i) = E2_down(find(n_down,0),find(m_down,0));
+
+    E2_up(find(n_up,0),find(m_up,0)) = 0.25*(E2_up(find(n_up,0),find(m_up,1)) +
+                                             E2_up(find(n_up,1),find(m_up,0)) +
+                                             E2_up(find(n_up,0),find(m_up,-1)) +
+                                             E2_up(find(n_up,-1),find(m_up,0)));
+    E2_down(find(n_down,0),find(m_down,0)) = 0.25*(E2_down(find(n_down,0),find(m_down,1)) +
+                                                   E2_down(find(n_down,1),find(m_down,0)) +
+                                                   E2_down(find(n_down,0),find(m_down,-1)) +
+                                                   E2_down(find(n_down,-1),find(m_down,0)));
+    
+    spec_R(i) = spec_R(i) - E2_up(find(n_up,0),find(m_up,0));
+    spec_T(i) = spec_T(i) - E2_down(find(n_down,0),find(m_down,0));
+    total_power_R(i) = spec_R(i) + sum(E2_up);
+    total_power_T(i) = spec_T(i) + sum(E2_down);
+
+    image(ux_up,uy_up,E2_up,"","","R (logscale), theta_in="+num2str(theta(i))+" degrees","polar,logplot");
+    image(ux_down,uy_down,E2_down,"","","T (logscale), theta_in="+num2str(theta(i))+" degrees","polar,logplot");
+
+    Ux_up = meshgridx(ux_up,uy_up);
+    Uy_up = meshgridy(ux_up,uy_up);
+    cos_theta_up = sqrt(1-Ux_up^2-Uy_up^2);
+
+    Ux_down = meshgridx(ux_down,uy_down);
+    Uy_down = meshgridy(ux_down,uy_down);
+    cos_theta_down = sqrt(1-Ux_down^2-Uy_down^2);
+    for(phi_c=1:length(phi_out)) {
+       BRDF(i,1:length(theta_out),phi_c) = farfield3dintegrate(E2_up*cos_theta_up,ux_up,uy_up,measurement_half_angle,theta_out,phi_out(phi_c))/
+                                           (farfield3dintegrate(0*E2_up+1,ux_up,uy_up,measurement_half_angle,theta_out,phi_out(phi_c))+1e-20);
+       BTDF(i,1:length(theta_out),phi_c) = farfield3dintegrate(E2_down*cos_theta_down,ux_down,uy_down,measurement_half_angle,theta_out,phi_out(phi_c))/
+                                           (farfield3dintegrate(0*E2_down+1,ux_down,uy_down,measurement_half_angle,theta_out,phi_out(phi_c))+1e-20);
+    }
+  } #theta
+  BRDF = real(BRDF);
+  BTDF = real(BTDF); 
+
+  plot(theta_out,transpose(pinch(BRDF,3,1)),"theta out","BRDF");
+  legend("theta = "+num2str(theta(1)),"theta = "+num2str(theta(2)),"theta = "+num2str(theta(3)),"theta = "+num2str(theta(4)),"theta = "+num2str(theta(5)));
+  plot(theta_out,transpose(pinch(BTDF,3,1)),"theta out","BTDF");
+  legend("theta = "+num2str(theta(1)),"theta = "+num2str(theta(2)),"theta = "+num2str(theta(3)),"theta = "+num2str(theta(4)),"theta = "+num2str(theta(5)));
+
+  ?"incident angle, specular R, specular T, total R, total T, total R+T";
+  for(i=1:length(theta)) {
+    ?num2str(theta(i))+", "+num2str(spec_R(i))+", "+num2str(spec_T(i))+", "
+    +num2str(total_power_R(i))+", "+num2str(total_power_T(i))+", "+num2str(total_power_T(i)+total_power_R(i));
+  }
+
+  lambda = c/getdata("BSDF::up","f");
+
+  # save the data to an ldf file
+  savedata(data_filename,theta,theta_out,phi_out,BRDF,BTDF,spec_R,spec_T,total_power_R,total_power_T,lambda);
+
+} #end run_analysis
+################################################
+
